@@ -1,0 +1,9 @@
+# build output
+/target
+/dist
+*.exe
+*.pdb
+
+# made next to the program when it runs; these hold the user's own file names
+/state
+/sections.local.ini
