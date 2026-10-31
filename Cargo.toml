@@ -2,7 +2,7 @@
 name = "rivulet"
 description = "A tiny desktop organiser for Windows: sections that flow open from a rail of labels."
 license = "MIT"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 build = "build.rs"
 

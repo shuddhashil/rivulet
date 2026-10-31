@@ -4,7 +4,7 @@
 
 ![Sections flowing open from a rail of labels](docs/demo.gif)
 
-*Illustration of the interaction, with made-up file names.*
+*Recorded from the running program on a generated wallpaper, showing the Liquid, Aurora and Neon styles with the Settings panel, so no real file names appear. GIF colours are coarser than on screen.*
 
 Rivulet sorts your desktop icons by type into a slim rail of labels on the left. Click a label and that section flows open. Click it again, or click empty desktop, and it folds away.
 
