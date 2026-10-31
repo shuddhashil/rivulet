@@ -30,7 +30,7 @@ Rivulet sorts your desktop icons by type into a slim rail of labels on the left.
 1. Download `rivulet.exe` from [Releases](../../releases) and put it in its own folder, such as `Documents\Rivulet`. It keeps its settings beside itself.
 2. Double-click it.
 
-To start it with Windows, run `rivulet.exe --install-login` from a terminal in that folder. `rivulet.exe --install` adds a Start menu entry.
+To start it with Windows, run `rivulet.exe --install-login` from a terminal in that folder. This uses a Task Scheduler logon task, because Windows can take minutes to work through the Startup folder on a busy PC, and icons would sit in columns until then. `rivulet.exe --install` adds a Start menu entry.
 
 **Windows may warn you.** Rivulet is unsigned, so SmartScreen can say it is unrecognised, and antivirus tools may be wary because it watches mouse clicks on the desktop and moves icons inside Explorer. It has to do both to work: the click watcher is how labels respond, and it reads nothing else. It makes no network connections. The source is all here, so you can build it yourself:
 
@@ -62,7 +62,7 @@ You can also add your own sections, change colours, set the shortcut, choose a s
 ## Stopping and removing it
 
 - **Undo and stop** in the right-click menu puts icons back where they were when Rivulet first started.
-- To remove it: choose Undo and stop, delete `Rivulet.lnk` from `shell:startup` if you added it, then delete its folder.
+- To remove it: choose Undo and stop, run `rivulet.exe --remove-login` if you turned on starting at login, then delete its folder.
 - **If icons ever seem to vanish,** right-click the desktop and choose Refresh. That always brings them back, even if Rivulet has crashed. It hides icons by placing them off-screen, and Windows pulls them back on Refresh.
 
 ## Status and limits

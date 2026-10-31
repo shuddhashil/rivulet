@@ -9,7 +9,8 @@
 //!   rivulet.exe --quit           lay every icon out in view and stop
 //!   rivulet.exe --undo           stop, and put the icons back as saved at first start
 //!   rivulet.exe --install        add a Start menu shortcut
-//!   rivulet.exe --install-login  also start automatically at every login
+//!   rivulet.exe --install-login  start right at every login
+//!   rivulet.exe --remove-login   stop starting at login
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod layers;
@@ -1364,10 +1365,57 @@ unsafe fn dry_run() -> Result<(), String> {
     Ok(())
 }
 
-fn install(at_login: bool) -> Result<(), String> {
+/// Start at login through Task Scheduler. Windows works through the Startup folder and Run keys
+/// slowly, one item every 30 seconds on a busy PC (measured at 4.5 minutes here), and icons sit
+/// out of place all that time; a logon task starts straight away.
+fn install_login() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let ps = "$a=New-ScheduledTaskAction -Execute $env:DS_EXE -WorkingDirectory $env:DS_DIR;\
+              $t=New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME;\
+              $p=New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited;\
+              $s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit 0 -Priority 5;\
+              Register-ScheduledTask -TaskName Rivulet -Action $a -Trigger $t -Principal $p -Settings $s -Force -ErrorAction Stop | Out-Null";
+    let done = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", ps])
+        .env("DS_EXE", &exe)
+        .env("DS_DIR", home())
+        .creation_flags(NO_WINDOW)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !done.status.success() {
+        return Err(format!(
+            "Windows would not create the login task. Try again from a terminal opened with Run as administrator.\n\n{}",
+            String::from_utf8_lossy(&done.stderr).lines().next().unwrap_or("")
+        ));
+    }
+    // the slow Startup folder entries from earlier versions would only start a pointless second launch
+    let startup = Path::new(&std::env::var("APPDATA").map_err(|e| e.to_string())?).join(r"Microsoft\Windows\Start Menu\Programs\Startup");
+    for old in ["Rivulet.lnk", "Desktop Sections.lnk"] {
+        if std::fs::remove_file(startup.join(old)).is_ok() {
+            println!("Removed the old {old} from the Startup folder");
+        }
+    }
+    println!("Rivulet will now start right at login. To turn that off: {} --remove-login", exe.display());
+    Ok(())
+}
+
+fn remove_login() -> Result<(), String> {
+    let done = std::process::Command::new("schtasks")
+        .args(["/Delete", "/TN", "Rivulet", "/F"])
+        .creation_flags(NO_WINDOW)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !done.status.success() {
+        return Err("There is no login task to remove.".into());
+    }
+    println!("Rivulet will no longer start at login.");
+    Ok(())
+}
+
+fn install() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let programs = Path::new(&std::env::var("APPDATA").map_err(|e| e.to_string())?).join(r"Microsoft\Windows\Start Menu\Programs");
-    let link = if at_login { programs.join("Startup").join("Rivulet.lnk") } else { programs.join("Rivulet.lnk") };
+    let link = programs.join("Rivulet.lnk");
     let ps = "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:DS_LINK);\
               $s.TargetPath=$env:DS_EXE;$s.WorkingDirectory=$env:DS_DIR;$s.Save()";
     let done = std::process::Command::new("powershell")
@@ -1403,8 +1451,9 @@ fn main() {
                 stop_running();
                 Ok(())
             }
-            "--install" => install(false),
-            "--install-login" => install(true),
+            "--install" => install(),
+            "--install-login" => install_login(),
+            "--remove-login" => remove_login(),
             _ => {
                 let window = running_instance();
                 if window.is_null() {
