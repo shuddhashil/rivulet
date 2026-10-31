@@ -127,10 +127,10 @@ pub fn build(cfg: &Config, login: bool, dpi: f32) -> Vec<Item> {
     b.heading("Recent");
     b.stepper("Days to look back (0 is off)", "days", cfg.recent_days, 0, 30);
     b.stepper("Most items to show", "limit", cfg.recent_limit as u64, 1, 24);
-    b.heading("Pretty mode");
-    b.switch("Smooth corners and soft edges", cfg.pretty, Action::Set("general", "pretty", on_off(!cfg.pretty)));
+    b.heading("Look");
+    b.choice("Style", "style", &["Plain", "Smooth", "Glass"], &cfg.style);
     let note = b.rect(MARGIN, WIDTH - 2.0 * MARGIN);
-    b.add(note, Look::Note("Uses 60-90 MB of memory, against 2 MB without. Applies when Rivulet next starts.".to_string()), None);
+    b.add(note, Look::Note("Plain uses 2 MB. Smooth and Glass use far more. Leaving Plain applies at next start.".to_string()), None);
     b.row += 1;
     let w = (WIDTH - 2.0 * MARGIN - 12.0) / 4.0;
     for (n, (text, action)) in [("Edit rules", Action::EditRules), ("Re-sort", Action::Resort), ("Undo and stop", Action::Undo), ("Stop", Action::Stop)].into_iter().enumerate() {
@@ -186,7 +186,7 @@ mod tests {
                     "dots" => assert_eq!(changed.dots, value == "on"),
                     "click_away" => assert_eq!(changed.click_away, value == "on"),
                     "double_click_hide" => assert_eq!(changed.double_click_hide, value == "on"),
-                    "pretty" => assert_eq!(changed.pretty, value == "on"),
+                    "style" => assert_eq!(changed.style, *value),
                     "days" => assert_eq!(changed.recent_days.to_string(), *value),
                     "limit" => assert_eq!(changed.recent_limit.to_string(), *value),
                     other => panic!("untested setting {other}"),

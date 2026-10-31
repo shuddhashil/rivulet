@@ -22,7 +22,8 @@ pub struct Config {
     pub dots: bool,
     pub click_away: bool,
     pub double_click_hide: bool,
-    pub pretty: bool,
+    /// plain, smooth or glass. Anything but plain needs the graphics libraries.
+    pub style: String,
 }
 
 fn on_off(key: &str, value: &str) -> Result<bool, String> {
@@ -96,8 +97,10 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
         dots: true,
         click_away: true,
         double_click_hide: true,
-        pretty: false,
+        style: "plain".to_string(),
     };
+    let mut old_pretty = false;
+    let mut style_given = false;
     let mut part = String::new();
     for line in text.lines().map(str::trim) {
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -156,11 +159,21 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
                 "dots" => cfg.dots = on_off(&key, value)?,
                 "click_away" => cfg.click_away = on_off(&key, value)?,
                 "double_click_hide" => cfg.double_click_hide = on_off(&key, value)?,
-                "pretty" => cfg.pretty = on_off(&key, value)?,
+                "pretty" => old_pretty = on_off(&key, value)?, // from before there were styles
+                "style" => {
+                    if !matches!(value, "plain" | "smooth" | "glass") {
+                        return Err(format!("sections.ini: style should be plain, smooth or glass: {line}"));
+                    }
+                    cfg.style = value.to_string();
+                    style_given = true;
+                }
                 _ => return Err(format!("sections.ini: unknown setting: {line}")),
             },
             _ => return Err(format!("sections.ini: line outside a known section: {line}")),
         }
+    }
+    if old_pretty && !style_given {
+        cfg.style = "smooth".to_string();
     }
     let known = |s: &String| cfg.types.iter().any(|(t, _)| t == s);
     let used = cfg.order.iter().chain(cfg.names.iter().map(|(_, s)| s));
@@ -402,8 +415,17 @@ mod tests {
     }
 
     #[test]
+    fn styles() {
+        let with = |general: &str| parse_config(&format!("[types]\nOther =\n[layout]\ncolumn1 = Other\n[general]\n{general}\n")).unwrap().style;
+        assert_eq!(with(""), "plain");
+        assert_eq!(with("pretty = on"), "smooth"); // the old setting still means what it did
+        assert_eq!(with("pretty = on\nstyle = glass"), "glass"); // a chosen style wins, either order
+        assert_eq!(with("style = plain\npretty = on"), "plain");
+    }
+
+    #[test]
     fn bad_settings_are_refused() {
-        for bad in ["side = up", "theme = neon", "speed = warp", "dots = maybe"] {
+        for bad in ["side = up", "theme = neon", "speed = warp", "dots = maybe", "style = wood"] {
             assert!(parse_config(&format!("[types]\nOther =\n[layout]\ncolumn1 = Other\n[general]\n{bad}\n")).is_err(), "{bad}");
         }
     }

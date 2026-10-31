@@ -21,15 +21,20 @@ pub fn current() -> String {
     String::from_utf16_lossy(&buf[..n])
 }
 
+/// The picture on the desktop, even if its original file has since gone.
+pub fn picture_path() -> Option<PathBuf> {
+    let now = current();
+    if Path::new(&now).exists() {
+        return Some(PathBuf::from(now));
+    }
+    let copy = Path::new(&std::env::var("APPDATA").ok()?).join(r"Microsoft\Windows\Themes\TranscodedWallpaper");
+    copy.exists().then_some(copy)
+}
+
 /// The wallpaper's average colour as blue, green, red. GDI+ runs only for this call, so it holds
 /// no memory the rest of the time.
 pub fn average_colour() -> Option<u32> {
-    let now = current();
-    let path = if Path::new(&now).exists() {
-        PathBuf::from(now)
-    } else {
-        Path::new(&std::env::var("APPDATA").ok()?).join(r"Microsoft\Windows\Themes\TranscodedWallpaper")
-    };
+    let path = picture_path()?;
     unsafe {
         let (mut token, input) = (0, GdiplusStartupInput { GdiplusVersion: 1, ..std::mem::zeroed() });
         if GdiplusStartup(&mut token, &input, std::ptr::null_mut()) != 0 {

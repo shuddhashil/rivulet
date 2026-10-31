@@ -683,9 +683,24 @@ impl Sections {
     }
 
     /// A fixed theme, or a dark shade of the wallpaper's average colour.
-    fn apply_theme(&mut self, theme: &str) {
-        let now = format!("{theme}|{}", wallpaper::current());
+    /// Glass needs a fresh blurred wallpaper; the other styles don't keep one.
+    fn apply_style(&self, style: &str) {
+        unsafe {
+            if style == "glass" && pretty::is_on() {
+                if let Err(e) = pretty::load_backdrop(GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) {
+                    log(&format!("glass unavailable, using the smooth look: {e}"));
+                    pretty::drop_backdrop();
+                }
+            } else {
+                pretty::drop_backdrop();
+            }
+        }
+    }
+
+    fn apply_theme(&mut self, theme: &str, style: &str) {
+        let now = format!("{theme}|{style}|{}", wallpaper::current());
         if now != self.tinted_for {
+            self.apply_style(style);
             if let Some((pill, panel)) = theme_tints(theme) {
                 layers::set_tints(pill, panel);
             } else if let Some(average) = wallpaper::average_colour() {
@@ -715,7 +730,7 @@ impl Sections {
             SendMessageW(self.main_window as HWND, WM_REMAKE, 0, 0);
         }
         let plan = load_plan(&self.desk)?;
-        self.apply_theme(&plan.cfg.theme);
+        self.apply_theme(&plan.cfg.theme, &plan.cfg.style);
         CLICK_AWAY.store(plan.cfg.click_away, Ordering::Relaxed);
         DOUBLE_CLICK_HIDES.store(plan.cfg.double_click_hide, Ordering::Relaxed);
         if let Some(open) = &self.open {
@@ -1321,7 +1336,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
 
 /// Falls back to the plain look on any failure, so a machine that can't do this still works.
 unsafe fn start_pretty_if_wanted() {
-    let wanted = std::fs::read_to_string(rules_file()).ok().and_then(|t| parse_config(&t).ok()).is_some_and(|c| c.pretty);
+    let wanted = std::fs::read_to_string(rules_file()).ok().and_then(|t| parse_config(&t).ok()).is_some_and(|c| c.style != "plain");
     if wanted {
         match layers::start_pretty() {
             Ok(()) => log("pretty mode on"),

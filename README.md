@@ -24,7 +24,7 @@ Rivulet sorts your desktop icons by type into a slim rail of labels on the left.
 - **Ctrl+Alt+D** shows the desktop with your last section open. Press again to go back.
 - **A Settings label** for themes, labels on the left or right, animation speed, and more.
 - **Double-click empty desktop** to hide the labels for a completely clean screen, and again to bring them back.
-- **Optional Pretty mode** for smooth corners and soft shadows. It's off by default and uses 60-90 MB, because it needs the graphics card. With it off, those libraries are never loaded.
+- **Three styles.** Plain is the default and uses 2-3 MB. Smooth adds soft corners and shadows (60-90 MB). Glass is frosted glass made from your own wallpaper, with edges that bend the picture like a thick lens (55-100 MB). Both need the graphics card; with Plain, those libraries are never loaded.
 - Colours per section, five themes, and tints that follow your wallpaper.
 - New files are sorted as they arrive, and it recovers by itself if Explorer restarts.
 
@@ -93,7 +93,8 @@ This is an early release, so please read this.
 - **Tested on one setup:** Windows 11 version 26H2 (build 26300), one 1920x1080 screen at 125%. Tests covered a forced crash, an Explorer restart, Undo and repeated Refreshes.
 - **Older Windows versions are untested.** There is a fallback for the older desktop layout, but it has never been run on a real machine. It needs Windows 10 version 1703 or later.
 - **A second screen is untested.** Choosing a screen in the rules is written and unit tested, but has not been tried on real hardware.
-- Without Pretty mode, rounded corners are slightly rough, because Windows does not allow fine per-pixel transparency in this layer without a much heavier drawing method.
+- In the Plain style, rounded corners are slightly rough, because Windows does not allow fine per-pixel transparency in this layer without a much heavier drawing method.
+- Glass assumes the wallpaper uses Windows' Fill setting. With another setting, or across a second screen, the frosted picture may not line up with the real one.
 - Hidden icons can flash for a moment on Refresh.
 - It relies on undocumented Windows behaviour, so a Windows update could break it.
 - One section opens at a time, and a section cannot hold more icons than fit on the screen.
