@@ -936,10 +936,12 @@ fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Com
         let last_section = open.clone();
         let mut s = Sections { desk, open, hover: None, hidden: vec![], count: 0, seen: None, last_plan: None, last_section, shortcut_showing: false, tinted_for: String::from("\0"), main_window: window };
         if let Err(e) = s.settle() {
+            log(&format!("first sort failed: {e}"));
             alert(&e);
             PostMessageW(window as HWND, WM_CLOSE, 0, 0);
             return;
         }
+        log("running");
         loop {
             let result = match rx.recv_timeout(CHECK_EVERY) {
                 Ok(Command::Toggle(name)) => s.toggle(name),
@@ -1192,11 +1194,57 @@ unsafe fn doctor() -> Result<(), String> {
     Ok(())
 }
 
+/// A short record of starts and problems, with no file names in it, for bug reports.
+fn log(line: &str) {
+    use std::io::Write;
+    const KEEP: u64 = 64 * 1024;
+    let path = state_dir().join("log.txt");
+    if path.metadata().is_ok_and(|m| m.len() > KEEP) {
+        let _ = std::fs::remove_file(&path);
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{now} {line}");
+    }
+}
+
+/// At login the program starts before the desktop is ready, so a failure here usually only means
+/// "not yet". Keep trying quietly, and report a problem only if it never clears.
+unsafe fn wait_for_desktop() -> Result<Desktop, String> {
+    const PATIENCE: Duration = Duration::from_secs(120);
+    let began = Instant::now();
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let ready = layers::parent_view()
+            .ok_or_else(|| "The desktop is not ready.".to_string())
+            .and_then(|_| Desktop::open())
+            .and_then(|desk| grid_off().map(|_| desk));
+        match ready {
+            Ok(desk) => {
+                log(&format!("desktop ready after {} s, {attempts} attempts", began.elapsed().as_secs()));
+                return Ok(desk);
+            }
+            Err(e) if began.elapsed() >= PATIENCE => {
+                log(&format!("gave up: {e}"));
+                return Err(e);
+            }
+            Err(_) => std::thread::sleep(Duration::from_secs(2)),
+        }
+    }
+}
+
 unsafe fn run() -> Result<(), String> {
     ensure_rules()?;
     std::fs::create_dir_all(state_dir()).map_err(|e| e.to_string())?;
-    grid_off()?;
-    let desk = Desktop::open()?;
+    // only one copy, even during the wait below, before the message window exists; Windows
+    // releases this when the process ends, however it ends
+    let lock = CreateMutexW(std::ptr::null(), 0, wide("DesktopSectionsOneCopy").as_ptr());
+    if !lock.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
+        return Ok(());
+    }
+    log(&format!("started, version {}", env!("CARGO_PKG_VERSION")));
+    let desk = wait_for_desktop()?;
     load_plan(&desk)?; // refuse now, before anything has changed
     wallpaper::restore()?;
     if !snapshot_file().exists() {
@@ -1369,6 +1417,7 @@ fn main() {
         }
     };
     if let Err(e) = result {
+        log(&format!("stopped with a problem: {e}"));
         alert(&e);
         std::process::exit(1);
     }
