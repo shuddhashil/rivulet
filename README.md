@@ -10,7 +10,7 @@ Rivulet sorts your desktop icons by type into a slim rail of labels on the left.
 
 ## Why
 
-- **Tiny.** A single exe of under 400 KB, written in Rust.
+- **Tiny.** A single exe of about 400 KB, written in Rust.
 - **Light.** Measured at 2-3 MB of its own memory while idle (10-17 MB counting Windows libraries shared with other programs), and almost no CPU.
 - **Safe for your files.** Nothing is moved, renamed or hidden on disk. Only icon positions change, so every path keeps working.
 - **Leaves your wallpaper alone.** It draws in its own see-through layer behind the icons.
@@ -22,7 +22,10 @@ Rivulet sorts your desktop icons by type into a slim rail of labels on the left.
 - **A dot** on a label means something new arrived that you have not looked at.
 - **Drag an icon onto a label** to file it there for good.
 - **Ctrl+Alt+D** shows the desktop with your last section open. Press again to go back.
-- Colours per section, and tints that follow your wallpaper.
+- **A Settings label** for themes, labels on the left or right, animation speed, and more.
+- **Double-click empty desktop** to hide the labels for a completely clean screen, and again to bring them back.
+- **Optional Pretty mode** for smooth corners and soft shadows. It's off by default and uses 60-90 MB, because it needs the graphics card. With it off, those libraries are never loaded.
+- Colours per section, five themes, and tints that follow your wallpaper.
 - New files are sorted as they arrive, and it recovers by itself if Explorer restarts.
 
 ## Install
@@ -46,6 +49,8 @@ cargo build --release
 | Close the open section | Click empty desktop |
 | File an icon in a section | Drag it onto the label |
 | Show the desktop and last section | Ctrl+Alt+D |
+| Hide or show the labels | Double-click empty desktop |
+| Change themes and behaviour | Click the Settings label |
 | Re-sort, edit rules, undo or stop | Right-click any label |
 
 ## Your own rules
@@ -57,7 +62,23 @@ Right-click a label and choose **Edit rules** to open `sections.ini`. For exampl
 *thesis* = Word
 ```
 
-You can also add your own sections, change colours, set the shortcut, choose a screen and adjust Recent. The file explains each setting.
+To make a section of your own, such as Thesis, add one line under each of these headings:
+
+```ini
+[types]
+Thesis =
+
+[names]
+*thesis* = Thesis
+
+[layout]
+column5 = Thesis
+
+[colours]
+Thesis = 38C6D9
+```
+
+The same file also sets the shortcut and the screen. It explains each setting.
 
 ## Stopping and removing it
 
@@ -72,7 +93,7 @@ This is an early release, so please read this.
 - **Tested on one setup:** Windows 11 version 26H2 (build 26300), one 1920x1080 screen at 125%. Tests covered a forced crash, an Explorer restart, Undo and repeated Refreshes.
 - **Older Windows versions are untested.** There is a fallback for the older desktop layout, but it has never been run on a real machine. It needs Windows 10 version 1703 or later.
 - **A second screen is untested.** Choosing a screen in the rules is written and unit tested, but has not been tried on real hardware.
-- Rounded corners are slightly rough, because Windows does not allow fine per-pixel transparency in this layer without a much heavier drawing method.
+- Without Pretty mode, rounded corners are slightly rough, because Windows does not allow fine per-pixel transparency in this layer without a much heavier drawing method.
 - Hidden icons can flash for a moment on Refresh.
 - It relies on undocumented Windows behaviour, so a Windows update could break it.
 - One section opens at a time, and a section cannot hold more icons than fit on the screen.

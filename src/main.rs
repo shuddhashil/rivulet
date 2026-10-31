@@ -14,10 +14,13 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod layers;
+mod pretty;
 mod rules;
+mod settings;
 mod wallpaper;
 
 use rules::*;
+use settings::{Action, SETTINGS};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::os::windows::process::CommandExt;
@@ -30,9 +33,9 @@ use wallpaper::wide;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, InvalidateRect, ScreenToClient, HDC, HMONITOR, MONITORINFO};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::RegisterHotKey;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, RegisterHotKey};
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
@@ -47,6 +50,8 @@ const LVM_GETITEMPOSITION: u32 = 0x1010;
 const LVM_GETITEMSPACING: u32 = 0x1033;
 const LVM_SETICONSPACING: u32 = 0x1035;
 const LVM_GETITEMTEXTW: u32 = 0x1073;
+const LVM_GETEXTENDEDLISTVIEWSTYLE: u32 = 0x1037;
+const LVS_EX_SNAPTOGRID: isize = 0x80000;
 const LVS_AUTOARRANGE: i32 = 0x100;
 const LVNI_SELECTED: isize = 2;
 const CLASS: &str = "DesktopSectionsMessages";
@@ -62,8 +67,6 @@ const EVENT_OBJECT_NAMECHANGE: u32 = 0x800C;
 /// A backstop only: Windows normally tells the program about changes as they happen.
 const CHECK_EVERY: Duration = Duration::from_secs(3);
 const NO_WINDOW: u32 = 0x0800_0000;
-const OPEN_TIME: f32 = 0.24;
-const CLOSE_TIME: f32 = 0.11;
 
 #[repr(C)]
 #[derive(Default)]
@@ -204,6 +207,11 @@ impl Desktop {
 
     unsafe fn set_spacing(&self, w: i32, h: i32) {
         SendMessageW(self.lv, LVM_SETICONSPACING, 0, (((h & 0xFFFF) << 16) | (w & 0xFFFF)) as isize);
+    }
+
+    /// Reading this is instant, unlike changing it, so startup only pays when it has to.
+    unsafe fn grid_is_on(&self) -> bool {
+        SendMessageW(self.lv, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0) & LVS_EX_SNAPTOGRID != 0
     }
 
     unsafe fn width(&self) -> i32 {
@@ -347,6 +355,7 @@ struct Plan {
     /// An icon can be in Recent as well as its own section; only one section is ever open.
     groups: Vec<(String, Vec<usize>)>,
     colours: HashMap<String, u32>,
+    cfg: Config,
     m: Metrics,
     view_origin: (i32, i32),
     layer_origin: (i32, i32),
@@ -377,6 +386,7 @@ fn glyph(section: &str) -> char {
         "Apps" => '\u{E71D}',
         "Zips" => '\u{E7B8}',
         "Other" => '\u{E712}',
+        SETTINGS => '\u{E713}',
         _ => '\u{E8A5}',
     }
 }
@@ -390,30 +400,48 @@ impl Plan {
         *self.colours.get(section).unwrap_or(&0x00C8B090)
     }
 
-    /// Centre height of a section's label, inside the work area.
-    fn pill_mid(&self, at: usize) -> i32 {
+    /// Top of a label inside the rail. Settings sits a little apart from the file sections.
+    fn pill_top(&self, at: usize) -> i32 {
         let m = self.m;
-        m.gap + at as i32 * (m.pill_h + m.pill_gap) + m.pill_h / 2
+        let apart = if self.groups.get(at).is_some_and(|g| g.0 == SETTINGS) { (12.0 * m.dpi) as i32 } else { 0 };
+        at as i32 * (m.pill_h + m.pill_gap) + apart
     }
 
-    fn panel_x(&self) -> i32 {
-        self.m.gap + self.m.rail_w + self.m.bridge
+    /// Centre height of a section's label, inside the work area.
+    fn pill_mid(&self, at: usize) -> i32 {
+        self.m.gap + self.pill_top(at) + self.m.pill_h / 2
+    }
+
+    fn rail_x(&self) -> i32 {
+        let m = self.m;
+        if self.cfg.right_side { self.room.0 - m.gap - m.rail_w } else { m.gap }
+    }
+
+    /// Where a panel of this width sits, on the far side of the neck from the rail.
+    fn panel_x(&self, w: i32) -> i32 {
+        let m = self.m;
+        if self.cfg.right_side { self.rail_x() - m.bridge - w } else { self.rail_x() + m.rail_w + m.bridge }
     }
 
     fn panel_room(&self) -> (i32, i32) {
         let m = self.m;
-        (self.room.0 - self.panel_x() - m.gap - 2 * m.pad, self.room.1 - 2 * m.gap - 2 * m.pad)
+        (self.room.0 - (m.gap + m.rail_w + m.bridge) - m.gap - 2 * m.pad, self.room.1 - 2 * m.gap - 2 * m.pad)
     }
 
     /// The open panel, level with its label where it fits, and how many icons fit across it.
     fn panel(&self, at: usize) -> Option<(Rect, i32)> {
         let m = self.m;
         let (room_w, room_h) = self.panel_room();
-        let (across, rows) = panel_grid(self.groups[at].1.len() as i32, m.cell_w, m.cell_h, room_w, room_h)?;
-        let h = rows * m.cell_h + 2 * m.pad;
+        let (across, w, h) = if self.groups[at].0 == SETTINGS {
+            let (w, h) = settings::size(m.dpi);
+            (1, w, h)
+        } else {
+            let (across, rows) = panel_grid(self.groups[at].1.len() as i32, m.cell_w, m.cell_h, room_w, room_h)?;
+            (across, across * m.cell_w + 2 * m.pad, rows * m.cell_h + 2 * m.pad)
+        };
         let lowest = (self.room.1 - m.gap - h).max(m.gap);
         let y = (self.pill_mid(at) - (30.0 * m.dpi) as i32).clamp(m.gap, lowest);
-        Some((Rect { x: self.panel_x(), y, w: across * m.cell_w + 2 * m.pad, h }, across))
+        Some((Rect { x: self.panel_x(w), y, w, h }, across))
     }
 
     /// Where the nth icon of an open panel sits, in the icon view's coordinates.
@@ -483,6 +511,7 @@ unsafe fn make_plan(desk: &Desktop, cfg: &Config) -> Result<Plan, String> {
             groups.push((section.clone(), items.into_iter().map(|x| x.2).collect::<Vec<_>>()));
         }
     }
+    groups.push((SETTINGS.to_string(), vec![]));
 
     let dpi = GetDpiForWindow(desk.lv) as f32 / 96.0;
     let work = chosen_work_area(cfg.monitor);
@@ -510,6 +539,7 @@ unsafe fn make_plan(desk: &Desktop, cfg: &Config) -> Result<Plan, String> {
             labels: vec![],
             groups: vec![],
             colours: cfg.colours.iter().cloned().collect(),
+            cfg: cfg.clone(),
             m,
             view_origin: (origin.x, origin.y),
             layer_origin: layers::to_parent(work.left, work.top),
@@ -545,6 +575,8 @@ enum Command {
     Close,
     Hover(Option<String>),
     Filed(String),
+    SettingsClick(POINT),
+    ToggleRail,
     Shortcut,
     Changed,
     Retidy,
@@ -567,6 +599,8 @@ struct Sections {
     last_plan: Option<Plan>,
     last_section: Option<String>,
     shortcut_showing: bool,
+    rail_hidden: bool,
+    login: bool,
     tinted_for: String,
     main_window: usize,
 }
@@ -604,14 +638,20 @@ impl Sections {
 
     /// Draw the rail and remember where each label is for clicks.
     unsafe fn show_rail(&self, plan: &Plan) {
+        if self.rail_hidden {
+            LABELS.lock().unwrap().clear();
+            layers::hide_rail();
+            return;
+        }
         let m = plan.m;
-        let height = plan.groups.len() as i32 * (m.pill_h + m.pill_gap);
+        let height = plan.pill_top(plan.groups.len().saturating_sub(1)) + m.pill_h + m.pill_gap;
         let (sx, sy) = plan.screen_origin;
+        let rail_x = plan.rail_x();
         let (mut hits, mut pills) = (vec![], vec![]);
         for (at, (name, icons)) in plan.groups.iter().enumerate() {
-            let top = at as i32 * (m.pill_h + m.pill_gap);
+            let top = plan.pill_top(at);
             let rect = RECT { left: 0, top, right: m.rail_w, bottom: top + m.pill_h };
-            let fresh = self.seen.as_ref().is_some_and(|seen| icons.iter().any(|&i| !seen.contains(&plan.labels[i].to_lowercase())));
+            let fresh = plan.cfg.dots && self.seen.as_ref().is_some_and(|seen| icons.iter().any(|&i| !seen.contains(&plan.labels[i].to_lowercase())));
             pills.push(layers::Pill {
                 name: name.clone(),
                 count: icons.len(),
@@ -622,33 +662,44 @@ impl Sections {
                 glyph: glyph(name),
                 rect,
             });
-            let screen = RECT { left: sx + m.gap, top: sy + m.gap + top, right: sx + m.gap + m.rail_w, bottom: sy + m.gap + top + m.pill_h };
+            let screen = RECT { left: sx + rail_x, top: sy + m.gap + top, right: sx + rail_x + m.rail_w, bottom: sy + m.gap + top + m.pill_h };
             hits.push(Label { name: name.clone(), rect: screen });
         }
         *layers::PILLS.lock().unwrap() = pills;
         *LABELS.lock().unwrap() = hits;
         let (lx, ly) = plan.layer_origin;
-        layers::show_rail(lx + m.gap, ly + m.gap, m.rail_w + 1, height.max(1), m.radius);
+        layers::show_rail(lx + rail_x, ly + m.gap, m.rail_w + 1, height.max(1), m.radius);
     }
 
     unsafe fn draw_open(&self, plan: &Plan, at: usize, r: Rect, reach: f32) {
         let m = plan.m;
         let (lx, ly) = plan.layer_origin;
         layers::set_panel(lx + r.x, ly + r.y, r.w, r.h, m.radius.min(r.h / 2).min(r.w / 2));
-        let start = (lx + m.gap + m.rail_w - 2, ly + plan.pill_mid(at));
-        let end = (lx + r.x + 2, ly + r.y + (r.h / 2).min((46.0 * m.dpi) as i32));
+        // from the rail's inner edge to the facing edge of the panel, on either side of the screen
+        let (start_x, end_x) = if plan.cfg.right_side { (plan.rail_x() + 2, r.x + r.w - 2) } else { (plan.rail_x() + m.rail_w - 2, r.x + 2) };
+        let start = (lx + start_x, ly + plan.pill_mid(at));
+        let end = (lx + end_x, ly + r.y + (r.h / 2).min((46.0 * m.dpi) as i32));
         layers::set_neck(start, end, reach, m.pill_h as f32 * 0.5, 2.5 * m.dpi);
     }
 
-    /// Follow the wallpaper: the rail and panel take a dark shade of its average colour.
-    fn follow_wallpaper(&mut self) {
-        let now = wallpaper::current();
+    /// A fixed theme, or a dark shade of the wallpaper's average colour.
+    fn apply_theme(&mut self, theme: &str) {
+        let now = format!("{theme}|{}", wallpaper::current());
         if now != self.tinted_for {
-            if let Some(average) = wallpaper::average_colour() {
+            if let Some((pill, panel)) = theme_tints(theme) {
+                layers::set_tints(pill, panel);
+            } else if let Some(average) = wallpaper::average_colour() {
                 layers::set_tints(dark_shade(average, 46.0), dark_shade(average, 24.0));
             }
             self.tinted_for = now;
         }
+    }
+
+    /// Fill the panel with controls if Settings is the open section, or clear them if not.
+    unsafe fn sync_settings(&self, plan: &Plan) {
+        let showing = self.open.as_deref() == Some(SETTINGS);
+        SETTINGS_OPEN.store(showing, Ordering::Relaxed);
+        layers::set_settings(if showing { settings::build(&plan.cfg, self.login, plan.m.dpi) } else { vec![] });
     }
 
     /// Put everything exactly where it belongs, with no animation.
@@ -656,13 +707,17 @@ impl Sections {
         if !self.desk.alive() {
             self.desk = Desktop::open()?; // Explorer restarted
             ICON_LIST.store(self.desk.lv as usize, Ordering::Relaxed);
-            grid_off()?;
+            if self.desk.grid_is_on() {
+                grid_off()?;
+            }
         }
         if !layers::alive() {
             SendMessageW(self.main_window as HWND, WM_REMAKE, 0, 0);
         }
-        self.follow_wallpaper();
         let plan = load_plan(&self.desk)?;
+        self.apply_theme(&plan.cfg.theme);
+        CLICK_AWAY.store(plan.cfg.click_away, Ordering::Relaxed);
+        DOUBLE_CLICK_HIDES.store(plan.cfg.double_click_hide, Ordering::Relaxed);
         if let Some(open) = &self.open {
             if plan.index(open).is_none() {
                 self.open = None; // that section has emptied
@@ -701,6 +756,7 @@ impl Sections {
         self.count = plan.labels.len();
         self.update_seen(&plan, open_at);
         self.show_rail(&plan);
+        self.sync_settings(&plan);
         match shown_panel {
             Some((at, r, _)) => {
                 layers::set_accent(plan.colour(&plan.groups[at].0));
@@ -723,16 +779,18 @@ impl Sections {
         let icons = plan.groups[at].1.clone();
         let m = plan.m;
         layers::set_accent(plan.colour(&plan.groups[at].0));
+        let right = plan.cfg.right_side;
         let seed = Rect { x: full.x, y: (plan.pill_mid(at) - m.pill_h / 2).clamp(m.gap, plan.room.1 - m.pill_h), w: m.pill_h, h: m.pill_h };
         let rows = (icons.len() as i32 + across - 1) / across;
-        let seconds = if opening { OPEN_TIME } else { CLOSE_TIME };
+        let (open_time, close_time) = speed_times(&plan.cfg.speed);
+        let seconds = if opening { open_time } else { close_time };
         let parked = (self.far(), plan.view_origin.1);
         let slide = (22.0 * m.dpi) as f32;
         // only the part of the icon list inside the panel needs repainting
         let dirty = RECT {
             left: plan.view_origin.0 + full.x - slide as i32,
             top: plan.view_origin.1 + full.y,
-            right: plan.view_origin.0 + full.x + full.w,
+            right: plan.view_origin.0 + full.x + full.w + slide as i32,
             bottom: plan.view_origin.1 + full.y + full.h,
         };
         if !opening {
@@ -741,16 +799,21 @@ impl Sections {
         let mut placed = vec![parked; icons.len()];
         let began = Instant::now();
         loop {
-            let t = (began.elapsed().as_secs_f32() / seconds).min(1.0);
+            let t = if seconds > 0.0 { (began.elapsed().as_secs_f32() / seconds).min(1.0) } else { 1.0 };
             let progress = if opening { t } else { 1.0 - t };
-            let shape = if opening { spring(progress) } else { ease_out(progress) };
-            let r = Rect { x: full.x, y: mix(seed.y, full.y, shape), w: mix(seed.w, full.w, shape), h: mix(seed.h, full.h, shape) };
+            // the last frame lands exactly on full size, which is what tells Pretty mode it has stopped
+            let shape = if opening && t >= 1.0 { 1.0 } else if opening { spring(progress) } else { ease_out(progress) };
+            let w = mix(seed.w, full.w, shape);
+            // the edge facing the rail stays put; the panel grows away from it
+            let x = if right { full.x + full.w - w } else { full.x };
+            let r = Rect { x, y: mix(seed.y, full.y, shape), w, h: mix(seed.h, full.h, shape) };
             self.draw_open(plan, at, r, ease_out((progress * 2.2).min(1.0)));
             if opening {
                 let wanted: Vec<(i32, i32)> = (0..icons.len() as i32)
                     .map(|n| {
                         // the panel uncovers each icon as it grows past it; it then slides the last short way in
-                        let across_part = (n % across) as f32 / across as f32;
+                        let column = if right { across - 1 - n % across } else { n % across };
+                        let across_part = column as f32 / across as f32;
                         let down_part = (n / across) as f32 / rows.max(1) as f32;
                         let delay = across_part * 0.5 + down_part * 0.25;
                         let own = ((progress - delay) / 0.3).clamp(0.0, 1.0);
@@ -758,7 +821,8 @@ impl Sections {
                             return parked;
                         }
                         let to = plan.cell(full, across, n);
-                        (to.0 - (slide * (1.0 - ease_out(own))) as i32, to.1)
+                        let away = (slide * (1.0 - ease_out(own))) as i32;
+                        (if right { to.0 + away } else { to.0 - away }, to.1)
                     })
                     .collect();
                 let changed: Vec<usize> = (0..icons.len()).filter(|&n| wanted[n] != placed[n]).collect();
@@ -796,6 +860,9 @@ impl Sections {
         let previous = self.open.take();
         if let Some(at) = previous.as_deref().and_then(|s| plan.index(s)) {
             self.show_rail(plan);
+            if !animate {
+                self.sync_settings(plan);
+            }
             if animate {
                 self.flow(plan, at, false);
             } else {
@@ -833,6 +900,7 @@ impl Sections {
         std::thread::sleep(Duration::from_millis(120)); // let the windows clear before anything moves
         if self.open.is_none() {
             let plan = self.current_plan()?;
+            self.rail_hidden = false;
             let wanted = self.last_section.clone().filter(|s| plan.index(s).is_some()).or_else(|| plan.groups.first().map(|g| g.0.clone()));
             self.last_plan = Some(plan);
             if let Some(name) = wanted {
@@ -848,9 +916,14 @@ impl Sections {
         self.close_open(&plan, previous.as_deref() == Some(name.as_str()));
         if previous.as_deref() != Some(name.as_str()) {
             if let Some(at) = plan.index(&name) {
-                self.last_section = Some(name.clone());
+                if name == SETTINGS {
+                    self.login = login_is_on();
+                } else {
+                    self.last_section = Some(name.clone());
+                }
                 self.open = Some(name);
                 self.show_rail(&plan);
+                self.sync_settings(&plan);
                 self.flow(&plan, at, true);
             }
         }
@@ -880,7 +953,7 @@ impl Sections {
 
     /// An icon was dragged onto a label: pin the selected icons to that section.
     unsafe fn file_selected(&mut self, section: String) -> Result<(), String> {
-        if section == RECENT {
+        if section == RECENT || section == SETTINGS {
             return self.settle(); // Recent is worked out, not filed into
         }
         let mut text = std::fs::read_to_string(rules_file()).map_err(|e| e.to_string())?;
@@ -892,9 +965,57 @@ impl Sections {
         self.settle()
     }
 
+    /// A click inside the Settings panel.
+    unsafe fn settings_click(&mut self, pt: POINT) -> Result<(), String> {
+        let Some(panel) = *PANEL_ON_SCREEN.lock().unwrap() else { return Ok(()) };
+        let action = {
+            let items = layers::SETTINGS_ITEMS.lock().unwrap();
+            settings::action_at(&items, pt.x - panel.left, pt.y - panel.top)
+        };
+        match action {
+            Some(Action::Set(part, key, value)) => {
+                let text = set_setting(&std::fs::read_to_string(rules_file()).map_err(|e| e.to_string())?, part, key, &value);
+                parse_config(&text)?; // never write a rules file that would not load
+                std::fs::write(rules_file(), text).map_err(|e| e.to_string())?;
+                self.last_plan = None;
+                self.settle()
+            }
+            Some(Action::Login(on)) => {
+                if let Err(e) = if on { install_login() } else { remove_login() } {
+                    alert(&e);
+                }
+                self.login = login_is_on();
+                self.settle()
+            }
+            Some(Action::EditRules) => {
+                edit_rules();
+                Ok(())
+            }
+            Some(Action::Resort) => self.settle(),
+            Some(Action::Undo) => {
+                run_undo();
+                Ok(())
+            }
+            Some(Action::Stop) => {
+                send(Command::Stop);
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Double-click on empty desktop: hide the labels, or bring them back.
+    unsafe fn toggle_rail(&mut self) -> Result<(), String> {
+        if !self.rail_hidden {
+            self.close()?;
+        }
+        self.rail_hidden = !self.rail_hidden;
+        self.settle()
+    }
+
     /// Cheap backstop check, in case Windows did not report a change.
     unsafe fn needs_settle(&self) -> bool {
-        if !self.desk.alive() || !layers::alive() || self.desk.count() != self.count || wallpaper::current() != self.tinted_for {
+        if !self.desk.alive() || !layers::alive() || self.desk.count() != self.count || !self.tinted_for.ends_with(&wallpaper::current()) {
             return true;
         }
         let width = self.desk.width();
@@ -935,7 +1056,7 @@ unsafe fn restore_spacing(desk: &Desktop) {
 fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Command>, window: usize) {
     unsafe {
         let last_section = open.clone();
-        let mut s = Sections { desk, open, hover: None, hidden: vec![], count: 0, seen: None, last_plan: None, last_section, shortcut_showing: false, tinted_for: String::from("\0"), main_window: window };
+        let mut s = Sections { desk, open, hover: None, hidden: vec![], count: 0, seen: None, last_plan: None, last_section, shortcut_showing: false, rail_hidden: false, login: login_is_on(), tinted_for: String::from("\0"), main_window: window };
         if let Err(e) = s.settle() {
             log(&format!("first sort failed: {e}"));
             alert(&e);
@@ -952,6 +1073,8 @@ fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Com
                     Ok(())
                 }
                 Ok(Command::Filed(section)) => s.file_selected(section),
+                Ok(Command::SettingsClick(pt)) => s.settings_click(pt),
+                Ok(Command::ToggleRail) => s.toggle_rail(),
                 Ok(Command::Shortcut) => s.shortcut(),
                 Ok(Command::Changed) => {
                     // a refresh arrives as a burst of changes, so let it finish first
@@ -983,6 +1106,11 @@ fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Com
 // ---------- clicks on labels ----------
 
 static DRAG_FROM_PANEL: AtomicBool = AtomicBool::new(false);
+static SETTINGS_OPEN: AtomicBool = AtomicBool::new(false);
+static CLICK_AWAY: AtomicBool = AtomicBool::new(true);
+static DOUBLE_CLICK_HIDES: AtomicBool = AtomicBool::new(true);
+static SWALLOW_RELEASE: AtomicBool = AtomicBool::new(false);
+static LAST_EMPTY_PRESS: Mutex<Option<(Instant, POINT)>> = Mutex::new(None);
 static LAST_TOGGLE: Mutex<Option<Instant>> = Mutex::new(None);
 static HOVERING: Mutex<Option<String>> = Mutex::new(None);
 static RIGHT_ON_LABEL: AtomicBool = AtomicBool::new(false);
@@ -1005,11 +1133,21 @@ fn in_panel(pt: POINT) -> bool {
     PANEL_ON_SCREEN.try_lock().is_ok_and(|p| p.is_some_and(|r| pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom))
 }
 
+/// Two quick presses in nearly the same spot on empty desktop.
+unsafe fn is_double_press(pt: POINT) -> bool {
+    let Ok(mut last) = LAST_EMPTY_PRESS.try_lock() else { return false };
+    let limit = Duration::from_millis(GetDoubleClickTime() as u64);
+    let double = last.is_some_and(|(t, p)| t.elapsed() <= limit && (p.x - pt.x).abs() <= 4 && (p.y - pt.y).abs() <= 4);
+    *last = if double { None } else { Some((Instant::now(), pt)) };
+    double
+}
+
 /// Acts on the press, not the release, so a section starts moving under the finger.
-unsafe fn left_down(pt: POINT) {
+/// Returns true when the desktop should not see this click at all.
+unsafe fn left_down(pt: POINT) -> bool {
     DRAG_FROM_PANEL.store(false, Ordering::Relaxed);
     if !over_desktop(pt) {
-        return;
+        return false;
     }
     if let Some(name) = label_at(pt) {
         let mut last = LAST_TOGGLE.lock().unwrap();
@@ -1019,10 +1157,20 @@ unsafe fn left_down(pt: POINT) {
             send(Command::Toggle(name));
         }
     } else if in_panel(pt) {
+        if SETTINGS_OPEN.load(Ordering::Relaxed) {
+            send(Command::SettingsClick(pt));
+            return true; // a control, so no selection box should start on the desktop
+        }
         DRAG_FROM_PANEL.store(true, Ordering::Relaxed);
     } else {
-        send(Command::Close);
+        if CLICK_AWAY.load(Ordering::Relaxed) {
+            send(Command::Close);
+        }
+        if DOUBLE_CLICK_HIDES.load(Ordering::Relaxed) && is_double_press(pt) {
+            send(Command::ToggleRail);
+        }
     }
+    false
 }
 
 unsafe fn left_up(pt: POINT) {
@@ -1049,8 +1197,18 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
         let pt = (*(lparam as *const MSLLHOOKSTRUCT)).pt;
         match wparam as u32 {
             WM_MOUSEMOVE => mouse_moved(pt),
-            WM_LBUTTONDOWN => left_down(pt),
-            WM_LBUTTONUP => left_up(pt),
+            WM_LBUTTONDOWN => {
+                if left_down(pt) {
+                    SWALLOW_RELEASE.store(true, Ordering::Relaxed);
+                    return 1;
+                }
+            }
+            WM_LBUTTONUP => {
+                if SWALLOW_RELEASE.swap(false, Ordering::Relaxed) {
+                    return 1;
+                }
+                left_up(pt);
+            }
             WM_RBUTTONDOWN if over_desktop(pt) && label_at(pt).is_some() => {
                 RIGHT_ON_LABEL.store(true, Ordering::Relaxed);
                 return 1; // our menu, not the desktop's
@@ -1091,9 +1249,38 @@ unsafe fn watch_icons() {
     }
 }
 
+fn edit_rules() {
+    let _ = std::process::Command::new("notepad").arg(rules_file()).spawn();
+}
+
+fn run_undo() {
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe).arg("--undo").spawn();
+    }
+}
+
+/// Dark menus. Windows has no public switch for this, so it is looked up by number; if a future
+/// version drops it, the menu simply stays light.
+unsafe fn dark_menus() {
+    const SET_PREFERRED_APP_MODE: usize = 135;
+    const FLUSH_MENU_THEMES: usize = 136;
+    const FORCE_DARK: i32 = 2;
+    let theme = LoadLibraryW(wide("uxtheme.dll").as_ptr());
+    if theme.is_null() {
+        return;
+    }
+    if let (Some(set), Some(flush)) = (GetProcAddress(theme, SET_PREFERRED_APP_MODE as *const u8), GetProcAddress(theme, FLUSH_MENU_THEMES as *const u8)) {
+        let set: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(set);
+        let flush: unsafe extern "system" fn() = std::mem::transmute(flush);
+        set(FORCE_DARK);
+        flush();
+    }
+}
+
 unsafe fn show_menu(hwnd: HWND) {
+    dark_menus();
     let menu = CreatePopupMenu();
-    for (id, text) in [(1, "Re-sort now"), (2, "Edit rules"), (3, "Undo and stop"), (4, "Stop")] {
+    for (id, text) in [(5, "Settings"), (1, "Re-sort now"), (2, "Edit rules"), (3, "Undo and stop"), (4, "Stop")] {
         AppendMenuW(menu, MF_STRING, id, wide(text).as_ptr());
     }
     let mut pt = POINT { x: 0, y: 0 };
@@ -1104,15 +1291,10 @@ unsafe fn show_menu(hwnd: HWND) {
     DestroyMenu(menu);
     match chosen {
         1 => send(Command::Retidy),
-        2 => {
-            let _ = std::process::Command::new("notepad").arg(rules_file()).spawn();
-        }
-        3 => {
-            if let Ok(exe) = std::env::current_exe() {
-                let _ = std::process::Command::new(exe).arg("--undo").spawn();
-            }
-        }
+        2 => edit_rules(),
+        3 => run_undo(),
         4 => send(Command::Stop),
+        5 => send(Command::Toggle(SETTINGS.to_string())),
         _ => {}
     }
 }
@@ -1128,12 +1310,24 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             if let Err(e) = layers::create() {
                 eprintln!("{e}");
             }
+            start_pretty_if_wanted();
             watch_icons();
         }
         WM_CLOSE => PostQuitMessage(0),
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
     0
+}
+
+/// Falls back to the plain look on any failure, so a machine that can't do this still works.
+unsafe fn start_pretty_if_wanted() {
+    let wanted = std::fs::read_to_string(rules_file()).ok().and_then(|t| parse_config(&t).ok()).is_some_and(|c| c.pretty);
+    if wanted {
+        match layers::start_pretty() {
+            Ok(()) => log("pretty mode on"),
+            Err(e) => log(&format!("pretty mode unavailable, using the plain look: {e}")),
+        }
+    }
 }
 
 unsafe fn running_instance() -> HWND {
@@ -1180,7 +1374,7 @@ unsafe fn doctor() -> Result<(), String> {
             lines.push(format!("Scale: {}%", GetDpiForWindow(desk.lv) * 100 / 96));
             lines.push(format!("Auto arrange on: {}", GetWindowLongPtrW(desk.lv, GWL_STYLE) as i32 & LVS_AUTOARRANGE != 0));
             lines.push(match load_plan(&desk) {
-                Ok(plan) => format!("Sections: {}", plan.groups.iter().map(|(s, g)| format!("{s} {}", g.len())).collect::<Vec<_>>().join(", ")),
+                Ok(plan) => format!("Sections: {}", plan.groups.iter().filter(|g| g.0 != SETTINGS).map(|(s, g)| format!("{s} {}", g.len())).collect::<Vec<_>>().join(", ")),
                 Err(e) => format!("Problem: {e}"),
             });
         }
@@ -1220,7 +1414,7 @@ unsafe fn wait_for_desktop() -> Result<Desktop, String> {
         let ready = layers::parent_view()
             .ok_or_else(|| "The desktop is not ready.".to_string())
             .and_then(|_| Desktop::open())
-            .and_then(|desk| grid_off().map(|_| desk));
+            .and_then(|desk| if desk.grid_is_on() { grid_off().map(|_| desk) } else { Ok(desk) });
         match ready {
             Ok(desk) => {
                 log(&format!("desktop ready after {} s, {attempts} attempts", began.elapsed().as_secs()));
@@ -1257,7 +1451,7 @@ unsafe fn run() -> Result<(), String> {
             .collect();
         std::fs::write(snapshot_file(), lines.join("\n")).map_err(|e| e.to_string())?;
     }
-    let open = std::fs::read_to_string(open_file()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let open = std::fs::read_to_string(open_file()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s != SETTINGS);
 
     let instance = GetModuleHandleW(std::ptr::null());
     let class = wide(CLASS);
@@ -1275,6 +1469,7 @@ unsafe fn run() -> Result<(), String> {
     }
     OWNER.store(window as usize, Ordering::Relaxed);
     layers::create()?;
+    start_pretty_if_wanted();
     let (tx, rx) = channel();
     let _ = COMMANDS.set(tx);
     let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), instance, 0);
@@ -1353,7 +1548,7 @@ unsafe fn undo() -> Result<(), String> {
 unsafe fn dry_run() -> Result<(), String> {
     let desk = Desktop::open()?;
     let plan = load_plan(&desk)?;
-    for (s, g) in &plan.groups {
+    for (s, g) in plan.groups.iter().filter(|g| g.0 != SETTINGS) {
         println!("{s}: {}", g.len());
     }
     if plan.tightened {
@@ -1397,6 +1592,14 @@ fn install_login() -> Result<(), String> {
     }
     println!("Rivulet will now start right at login. To turn that off: {} --remove-login", exe.display());
     Ok(())
+}
+
+fn login_is_on() -> bool {
+    std::process::Command::new("schtasks")
+        .args(["/Query", "/TN", "Rivulet"])
+        .creation_flags(NO_WINDOW)
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
 fn remove_login() -> Result<(), String> {

@@ -3,6 +3,7 @@
 //! transparency in this slot, so each is shaped with a region and see-through as a whole.
 
 use crate::rules::{blend, neck_outline};
+use crate::settings::{Item, Look};
 use crate::wallpaper::wide;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -17,17 +18,21 @@ const CLASS: &str = "DesktopSectionsLayer";
 const SPAWN_LAYERS: u32 = 0x052C;
 const LWA_ALPHA_FLAG: u32 = 2;
 const WHITE: u32 = 0x00FFFFFF;
+const SOFT: u32 = 0x00B8B0A8;
+const PANEL_SEE_THROUGH: u8 = 170;
+const PANEL_READABLE: u8 = 240;
 
 static RAIL: AtomicUsize = AtomicUsize::new(0);
 static PANEL_WINDOW: AtomicUsize = AtomicUsize::new(0);
 static NECK: AtomicUsize = AtomicUsize::new(0);
-/// Colours are written blue, green, red. These follow the wallpaper and the open section.
+/// Colours are written blue, green, red. These follow the theme and the open section.
 static PILL_TINT: AtomicU32 = AtomicU32::new(0x00261A12);
 static PANEL_TINT: AtomicU32 = AtomicU32::new(0x00160E0A);
 static ACCENT: AtomicU32 = AtomicU32::new(0x00F0A040);
 
 pub struct Pill {
     pub name: String,
+    /// No number is shown for 0, as on the Settings label.
     pub count: usize,
     pub active: bool,
     pub hover: bool,
@@ -39,6 +44,77 @@ pub struct Pill {
 }
 
 pub static PILLS: Mutex<Vec<Pill>> = Mutex::new(Vec::new());
+pub static SETTINGS_ITEMS: Mutex<Vec<Item>> = Mutex::new(Vec::new());
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Style {
+    Label,
+    Small,
+    Heading,
+    Glyph,
+}
+
+/// What the rail and Settings need from a drawing surface.
+pub trait Canvas {
+    fn fill(&mut self, r: RECT, radius: i32, colour: u32);
+    fn text(&mut self, r: RECT, s: &str, colour: u32, style: Style, flags: u32);
+}
+
+struct GdiCanvas {
+    dc: HDC,
+    fonts: [HFONT; 4],
+}
+
+impl GdiCanvas {
+    unsafe fn new(dc: HDC, dpi: f32) -> GdiCanvas {
+        SetBkMode(dc, TRANSPARENT as _);
+        GdiCanvas { dc, fonts: [font("Segoe UI", 13.0 * dpi, 600), font("Segoe UI", 11.0 * dpi, 400), font("Segoe UI", 14.0 * dpi, 700), font("Segoe MDL2 Assets", 14.0 * dpi, 400)] }
+    }
+}
+
+impl Drop for GdiCanvas {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, GetStockObject(SYSTEM_FONT));
+            for f in self.fonts {
+                DeleteObject(f as _);
+            }
+        }
+    }
+}
+
+impl Canvas for GdiCanvas {
+    fn fill(&mut self, r: RECT, radius: i32, colour: u32) {
+        unsafe {
+            let brush = CreateSolidBrush(colour);
+            if radius <= 0 {
+                FillRect(self.dc, &r, brush);
+            } else {
+                let (old_brush, old_pen) = (SelectObject(self.dc, brush as _), SelectObject(self.dc, GetStockObject(NULL_PEN)));
+                RoundRect(self.dc, r.left, r.top, r.right + 1, r.bottom + 1, radius, radius);
+                SelectObject(self.dc, old_brush);
+                SelectObject(self.dc, old_pen);
+            }
+            DeleteObject(brush as _);
+        }
+    }
+
+    fn text(&mut self, r: RECT, s: &str, colour: u32, style: Style, flags: u32) {
+        unsafe {
+            let index = match style {
+                Style::Label => 0,
+                Style::Small => 1,
+                Style::Heading => 2,
+                Style::Glyph => 3,
+            };
+            SelectObject(self.dc, self.fonts[index] as _);
+            SetTextColor(self.dc, colour);
+            let w: Vec<u16> = s.encode_utf16().collect();
+            let mut area = r;
+            DrawTextW(self.dc, w.as_ptr() as _, w.len() as i32, &mut area, flags | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+    }
+}
 
 fn rail() -> HWND {
     RAIL.load(Ordering::Relaxed) as HWND
@@ -104,64 +180,89 @@ pub fn set_tints(pill: u32, panel_shade: u32) {
     PANEL_TINT.store(panel_shade, Ordering::Relaxed);
 }
 
+pub fn pill_tint() -> u32 {
+    PILL_TINT.load(Ordering::Relaxed)
+}
+pub fn panel_tint() -> u32 {
+    PANEL_TINT.load(Ordering::Relaxed)
+}
+pub fn accent() -> u32 {
+    ACCENT.load(Ordering::Relaxed)
+}
+pub fn settings_showing() -> bool {
+    SETTINGS_ITEMS.lock().is_ok_and(|i| !i.is_empty())
+}
+
 pub fn set_accent(colour: u32) {
     ACCENT.store(colour, Ordering::Relaxed);
 }
 
-unsafe fn fill(dc: HDC, r: &RECT, colour: u32) {
-    let brush = CreateSolidBrush(colour);
-    FillRect(dc, r, brush);
-    DeleteObject(brush as _);
+/// The Settings panel needs its text readable; icon panels stay more see-through.
+pub unsafe fn set_settings(items: Vec<Item>) {
+    let alpha = if items.is_empty() { PANEL_SEE_THROUGH } else { PANEL_READABLE };
+    *SETTINGS_ITEMS.lock().unwrap() = items;
+    SetLayeredWindowAttributes(panel(), 0, alpha, LWA_ALPHA_FLAG);
+    InvalidateRect(panel(), null(), 0);
 }
 
 unsafe fn font(name: &str, size: f32, weight: i32) -> HFONT {
     CreateFontW(-size as i32, 0, 0, 0, weight, 0, 0, 0, 0, 0, 0, CLEARTYPE_QUALITY as u32, 0, wide(name).as_ptr())
 }
 
-unsafe fn text(dc: HDC, s: &str, area: &mut RECT, colour: u32, flags: u32) {
-    SetTextColor(dc, colour);
-    let w: Vec<u16> = s.encode_utf16().collect();
-    DrawTextW(dc, w.as_ptr() as _, w.len() as i32, area, flags | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-}
-
-unsafe fn paint_rail(dc: HDC) {
-    let dpi = GetDpiForWindow(rail()) as f32 / 96.0;
-    let (label_font, glyph_font) = (font("Segoe UI", 13.0 * dpi, 600), font("Segoe MDL2 Assets", 14.0 * dpi, 400));
-    let old = SelectObject(dc, label_font as _);
-    SetBkMode(dc, TRANSPARENT as _);
+pub fn paint_rail_on(c: &mut dyn Canvas, dpi: f32, base: u32) {
     let scaled = |v: f32| (v * dpi) as i32;
-    let base = PILL_TINT.load(Ordering::Relaxed);
     if let Ok(pills) = PILLS.lock() {
         for p in pills.iter() {
-            let (r, background) = (p.rect, if p.active { blend(base, p.colour, 0.55) } else if p.hover { blend(base, p.colour, 0.28) } else { base });
-            fill(dc, &r, background);
-
-            SelectObject(dc, glyph_font as _);
-            let mut icon = RECT { left: r.left + scaled(10.0), top: r.top, right: r.left + scaled(32.0), bottom: r.bottom };
-            text(dc, &p.glyph.to_string(), &mut icon, if p.active { WHITE } else { p.colour }, DT_LEFT);
-
-            SelectObject(dc, label_font as _);
+            let r = p.rect;
+            let background = if p.active { blend(base, p.colour, 0.55) } else if p.hover { blend(base, p.colour, 0.28) } else { base };
+            c.fill(r, scaled(14.0), background);
+            let icon = RECT { left: r.left + scaled(10.0), top: r.top, right: r.left + scaled(32.0), bottom: r.bottom };
+            c.text(icon, &p.glyph.to_string(), if p.active { WHITE } else { p.colour }, Style::Glyph, DT_LEFT);
             let mut area = RECT { left: r.left + scaled(34.0), top: r.top, right: r.right - scaled(10.0), bottom: r.bottom };
-            let shade = if p.active { 0x00F0F0F0 } else { 0x00B8B0A8 };
-            text(dc, &p.count.to_string(), &mut area, shade, DT_RIGHT);
-            area.right -= scaled(24.0);
-            text(dc, &p.name, &mut area, WHITE, DT_LEFT | DT_END_ELLIPSIS);
-
+            if p.count > 0 {
+                c.text(area, &p.count.to_string(), if p.active { 0x00F0F0F0 } else { SOFT }, Style::Label, DT_RIGHT);
+                area.right -= scaled(24.0);
+            }
+            c.text(area, &p.name, WHITE, Style::Label, DT_LEFT | DT_END_ELLIPSIS);
             if p.fresh {
                 let (size, x, y) = (scaled(7.0), r.left + scaled(25.0), r.top + scaled(6.0));
-                let (brush, pen) = (CreateSolidBrush(p.colour), CreatePen(PS_SOLID, 1, WHITE));
-                let (old_brush, old_pen) = (SelectObject(dc, brush as _), SelectObject(dc, pen as _));
-                Ellipse(dc, x, y, x + size, y + size);
-                SelectObject(dc, old_brush);
-                SelectObject(dc, old_pen);
-                DeleteObject(brush as _);
-                DeleteObject(pen as _);
+                c.fill(RECT { left: x - 1, top: y - 1, right: x + size + 1, bottom: y + size + 1 }, size + 2, WHITE);
+                c.fill(RECT { left: x, top: y, right: x + size, bottom: y + size }, size, p.colour);
             }
         }
     }
-    SelectObject(dc, old);
-    DeleteObject(label_font as _);
-    DeleteObject(glyph_font as _);
+}
+
+pub fn paint_settings_on(c: &mut dyn Canvas, dpi: f32, base: u32, accent: u32) {
+    let radius = (10.0 * dpi) as i32;
+    let idle = blend(base, WHITE, 0.10);
+    if let Ok(items) = SETTINGS_ITEMS.lock() {
+        for item in items.iter() {
+            let r = item.rect;
+            match &item.look {
+                Look::Heading(t) => c.text(r, t, WHITE, Style::Heading, DT_LEFT),
+                Look::Text(t) => c.text(RECT { right: r.right + (200.0 * dpi) as i32, ..r }, t, 0x00E8E4E0, Style::Label, DT_LEFT),
+                Look::Note(t) => c.text(r, t, SOFT, Style::Small, DT_LEFT),
+                Look::Value(t) => c.text(r, t, WHITE, Style::Label, DT_CENTER),
+                Look::Button(t) => {
+                    c.fill(r, radius, idle);
+                    c.text(r, t, WHITE, Style::Label, DT_CENTER);
+                }
+                Look::Chip(t, on) => {
+                    c.fill(r, radius, if *on { blend(base, accent, 0.8) } else { idle });
+                    c.text(r, t, WHITE, Style::Small, DT_CENTER);
+                }
+                Look::Switch(on) => {
+                    let h = r.bottom - r.top;
+                    c.fill(r, h, if *on { accent } else { idle });
+                    let inset = (3.0 * dpi) as i32;
+                    let knob = h - 2 * inset;
+                    let x = if *on { r.right - inset - knob } else { r.left + inset };
+                    c.fill(RECT { left: x, top: r.top + inset, right: x + knob, bottom: r.top + inset + knob }, knob, WHITE);
+                }
+            }
+        }
+    }
 }
 
 unsafe extern "system" fn layer_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -173,20 +274,25 @@ unsafe extern "system" fn layer_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             let mut whole = RECT { left: 0, top: 0, right: 0, bottom: 0 };
             GetClientRect(hwnd, &mut whole);
             let accent = ACCENT.load(Ordering::Relaxed);
+            let (pill, shade) = (PILL_TINT.load(Ordering::Relaxed), PANEL_TINT.load(Ordering::Relaxed));
+            let dpi = GetDpiForWindow(hwnd) as f32 / 96.0;
+            let mut canvas = GdiCanvas::new(dc, dpi);
             if hwnd == rail() {
-                paint_rail(dc);
+                paint_rail_on(&mut canvas, dpi, pill);
             } else if hwnd == panel() {
-                fill(dc, &whole, blend(PANEL_TINT.load(Ordering::Relaxed), accent, 0.06));
-                let shape = CreateRectRgn(0, 0, 0, 0);
-                if GetWindowRgn(hwnd, shape) != 0 {
-                    let brush = CreateSolidBrush(blend(PANEL_TINT.load(Ordering::Relaxed), accent, 0.75));
-                    FrameRgn(dc, shape, brush, 1, 1);
+                canvas.fill(whole, 0, blend(shade, accent, 0.06));
+                let frame = CreateRectRgn(0, 0, 0, 0);
+                if GetWindowRgn(hwnd, frame) != 0 {
+                    let brush = CreateSolidBrush(blend(shade, accent, 0.75));
+                    FrameRgn(dc, frame, brush, 1, 1);
                     DeleteObject(brush as _);
                 }
-                DeleteObject(shape as _);
-            } else {
-                fill(dc, &whole, blend(PILL_TINT.load(Ordering::Relaxed), accent, 0.55));
+                DeleteObject(frame as _);
+                paint_settings_on(&mut canvas, dpi, pill, accent);
+            } else if hwnd == neck() {
+                canvas.fill(whole, 0, blend(pill, accent, 0.55));
             }
+            drop(canvas);
             EndPaint(hwnd, &ps);
             0
         }
@@ -217,7 +323,7 @@ pub unsafe fn create() -> Result<(), String> {
         h
     };
     // each new window goes straight behind the icons, so the rail, made last, ends up on top
-    let (p, n, r) = (make(170), make(225), make(225));
+    let (p, n, r) = (make(PANEL_SEE_THROUGH), make(225), make(225));
     if p.is_null() || n.is_null() || r.is_null() {
         return Err("Windows refused to create the section windows.".into());
     }
@@ -227,8 +333,41 @@ pub unsafe fn create() -> Result<(), String> {
     Ok(())
 }
 
+/// Pretty mode gets one clear window of its own behind the icons, covering the whole desktop.
+/// If anything refuses, the plain look simply carries on.
+pub unsafe fn start_pretty() -> Result<(), String> {
+    crate::pretty::stop();
+    let Some((parent, view)) = parent_view() else { return Err("the desktop is not ready".into()) };
+    let instance = GetModuleHandleW(null());
+    let class = wide(CLASS);
+    let mut whole = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    GetClientRect(parent, &mut whole);
+    let host = CreateWindowExW(WS_EX_NOACTIVATE, class.as_ptr(), class.as_ptr(), WS_CHILD | WS_VISIBLE, 0, 0, whole.right, whole.bottom, parent, null_mut(), instance, null());
+    if host.is_null() {
+        return Err("the window would not open".into());
+    }
+    SetWindowPos(host, view.unwrap_or(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    let dpi = GetDpiForWindow(host) as f32 / 96.0;
+    let started = crate::pretty::start(host, dpi);
+    if started.is_err() {
+        DestroyWindow(host);
+    } else {
+        ShowWindow(rail(), SW_HIDE);
+        hide_plain_panel();
+    }
+    started
+}
+
+unsafe fn hide_plain_panel() {
+    ShowWindow(panel(), SW_HIDE);
+    ShowWindow(neck(), SW_HIDE);
+}
+
 /// Lay the rail out from the current pills.
 pub unsafe fn show_rail(x: i32, y: i32, w: i32, h: i32, radius: i32) {
+    if crate::pretty::is_on() {
+        return crate::pretty::show_rail(x, y, w, h);
+    }
     let shape = CreateRectRgn(0, 0, 0, 0);
     if let Ok(pills) = PILLS.lock() {
         for p in pills.iter() {
@@ -242,17 +381,32 @@ pub unsafe fn show_rail(x: i32, y: i32, w: i32, h: i32, radius: i32) {
     repaint_rail();
 }
 
+pub unsafe fn hide_rail() {
+    if crate::pretty::is_on() {
+        return crate::pretty::hide_rail();
+    }
+    ShowWindow(rail(), SW_HIDE);
+}
+
 pub unsafe fn repaint_rail() {
+    if crate::pretty::is_on() {
+        return crate::pretty::repaint_rail();
+    }
     InvalidateRect(rail(), null(), 0);
     UpdateWindow(rail());
 }
 
 pub unsafe fn hide_panel() {
-    ShowWindow(panel(), SW_HIDE);
-    ShowWindow(neck(), SW_HIDE);
+    if crate::pretty::is_on() {
+        return crate::pretty::hide_panel();
+    }
+    hide_plain_panel();
 }
 
 pub unsafe fn set_panel(x: i32, y: i32, w: i32, h: i32, radius: i32) {
+    if crate::pretty::is_on() {
+        return crate::pretty::set_panel(x, y, w, h, radius);
+    }
     let (w, h) = (w.max(2), h.max(2));
     SetWindowPos(panel(), null_mut(), x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     SetWindowRgn(panel(), CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius), 1);
@@ -262,6 +416,9 @@ pub unsafe fn set_panel(x: i32, y: i32, w: i32, h: i32, radius: i32) {
 
 /// The liquid neck between two points, grown as far as `reach` (0 to 1).
 pub unsafe fn set_neck(from: (i32, i32), to: (i32, i32), reach: f32, end_width: f32, mid_width: f32) {
+    if crate::pretty::is_on() {
+        return crate::pretty::set_neck(from, to, reach, end_width, mid_width);
+    }
     let f = (from.0 as f32, from.1 as f32);
     let t = (to.0 as f32, to.1 as f32);
     let outline = neck_outline(f, t, reach, end_width, mid_width);

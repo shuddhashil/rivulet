@@ -2,6 +2,7 @@
 
 pub const RECENT: &str = "Recent";
 
+#[derive(Clone)]
 pub struct Config {
     pub types: Vec<(String, Vec<String>)>,
     pub names: Vec<(String, String)>,
@@ -15,6 +16,68 @@ pub struct Config {
     pub monitor: usize,
     /// Empty turns the shortcut off.
     pub hotkey: String,
+    pub right_side: bool,
+    pub theme: String,
+    pub speed: String,
+    pub dots: bool,
+    pub click_away: bool,
+    pub double_click_hide: bool,
+    pub pretty: bool,
+}
+
+fn on_off(key: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(format!("sections.ini: {key} should be on or off")),
+    }
+}
+
+/// A theme's label and panel colours (blue, green, red). None means follow the wallpaper.
+pub fn theme_tints(theme: &str) -> Option<(u32, u32)> {
+    match theme {
+        "midnight" => Some((0x00301C14, 0x001E100A)),
+        "graphite" => Some((0x002A2826, 0x00181716)),
+        "forest" => Some((0x001C2C14, 0x0010190A)),
+        "rose" => Some((0x0028183A, 0x00180E24)),
+        _ => None,
+    }
+}
+
+/// How long opening and closing take, in seconds.
+pub fn speed_times(speed: &str) -> (f32, f32) {
+    match speed {
+        "fast" => (0.15, 0.08),
+        "relaxed" => (0.38, 0.18),
+        "off" => (0.0, 0.0),
+        _ => (0.24, 0.11),
+    }
+}
+
+/// The rules file with [part] key = value set, keeping everything else exactly as it was.
+pub fn set_setting(text: &str, part: &str, key: &str, value: &str) -> String {
+    let line = format!("{key} = {value}");
+    let header = format!("[{part}]");
+    let mut lines: Vec<String> = text.lines().map(String::from).collect();
+    let mut inside = false;
+    let mut at = None;
+    for (i, l) in lines.iter_mut().enumerate() {
+        let trimmed = l.trim().to_string();
+        if trimmed.starts_with('[') {
+            inside = trimmed == header;
+            if inside {
+                at = Some(i);
+            }
+        } else if inside && !trimmed.starts_with('#') && trimmed.rsplit_once('=').is_some_and(|(k, _)| k.trim() == key) {
+            *l = line;
+            return lines.join("\n") + "\n";
+        }
+    }
+    match at {
+        Some(i) => lines.insert(i + 1, line),
+        None => lines.extend(["".to_string(), header, line]),
+    }
+    lines.join("\n") + "\n"
 }
 
 pub fn parse_config(text: &str) -> Result<Config, String> {
@@ -27,6 +90,13 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
         recent_limit: 12,
         monitor: 0,
         hotkey: "ctrl+alt+d".to_string(),
+        right_side: false,
+        theme: "wallpaper".to_string(),
+        speed: "normal".to_string(),
+        dots: true,
+        click_away: true,
+        double_click_hide: true,
+        pretty: false,
     };
     let mut part = String::new();
     for line in text.lines().map(str::trim) {
@@ -66,6 +136,27 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
                     }
                     cfg.hotkey = value.to_string();
                 }
+                "side" => match value {
+                    "left" => cfg.right_side = false,
+                    "right" => cfg.right_side = true,
+                    _ => return Err(format!("sections.ini: side should be left or right: {line}")),
+                },
+                "theme" => {
+                    if value != "wallpaper" && theme_tints(value).is_none() {
+                        return Err(format!("sections.ini: unknown theme: {line}"));
+                    }
+                    cfg.theme = value.to_string();
+                }
+                "speed" => {
+                    if !matches!(value, "fast" | "normal" | "relaxed" | "off") {
+                        return Err(format!("sections.ini: speed should be fast, normal, relaxed or off: {line}"));
+                    }
+                    cfg.speed = value.to_string();
+                }
+                "dots" => cfg.dots = on_off(&key, value)?,
+                "click_away" => cfg.click_away = on_off(&key, value)?,
+                "double_click_hide" => cfg.double_click_hide = on_off(&key, value)?,
+                "pretty" => cfg.pretty = on_off(&key, value)?,
                 _ => return Err(format!("sections.ini: unknown setting: {line}")),
             },
             _ => return Err(format!("sections.ini: line outside a known section: {line}")),
@@ -295,6 +386,35 @@ mod tests {
         assert_eq!(classify("x.weird", ".weird", &c), "Other");
         assert_eq!(c.colours[0], ("Word".to_string(), 0xFF8C3F)); // stored blue first
         assert_eq!((c.recent_days, c.recent_limit), (5, 2));
+    }
+
+    #[test]
+    fn settings_change_only_their_own_line() {
+        let start = "# keep me\n[general]\n# a note\nhotkey = ctrl+alt+d\n\n[names]\n*x* = Word\n";
+        let out = set_setting(start, "general", "hotkey", "ctrl+alt+k");
+        assert_eq!(out, "# keep me\n[general]\n# a note\nhotkey = ctrl+alt+k\n\n[names]\n*x* = Word\n");
+        // a new key joins its section, and a same-named key elsewhere is left alone
+        let added = set_setting(start, "general", "dots", "off");
+        assert!(added.contains("[general]\ndots = off\n"));
+        let elsewhere = set_setting("[a]\nk = 1\n[b]\nk = 2\n", "b", "k", "3");
+        assert_eq!(elsewhere, "[a]\nk = 1\n[b]\nk = 3\n");
+        assert!(set_setting("[a]\n", "b", "k", "3").ends_with("[b]\nk = 3\n"));
+    }
+
+    #[test]
+    fn bad_settings_are_refused() {
+        for bad in ["side = up", "theme = neon", "speed = warp", "dots = maybe"] {
+            assert!(parse_config(&format!("[types]\nOther =\n[layout]\ncolumn1 = Other\n[general]\n{bad}\n")).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_readme_custom_section_example_works() {
+        let mut text = include_str!("../sections.ini").to_string();
+        text.push_str("\n[types]\nThesis =\n[names]\n*thesis* = Thesis\n[layout]\ncolumn5 = Thesis\n[colours]\nThesis = 38C6D9\n");
+        let c = parse_config(&text).unwrap();
+        assert_eq!(classify("My THESIS draft.docx", ".docx", &c), "Thesis");
+        assert!(c.order.contains(&"Thesis".to_string()));
     }
 
     #[test]
