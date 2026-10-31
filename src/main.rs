@@ -679,15 +679,18 @@ impl Sections {
         let (start_x, end_x) = if plan.cfg.right_side { (plan.rail_x() + 2, r.x + r.w - 2) } else { (plan.rail_x() + m.rail_w - 2, r.x + 2) };
         let start = (lx + start_x, ly + plan.pill_mid(at));
         let end = (lx + end_x, ly + r.y + (r.h / 2).min((46.0 * m.dpi) as i32));
-        layers::set_neck(start, end, reach, m.pill_h as f32 * 0.5, 2.5 * m.dpi);
+        // liquid pours out thick and thins as it finishes
+        let swell = if plan.cfg.style == "liquid" { 1.0 + (1.0 - reach) * 0.9 } else { 1.0 };
+        let waist = if plan.cfg.style == "liquid" { 7.0 } else { 2.5 };
+        layers::set_neck(start, end, reach, m.pill_h as f32 * 0.5 * swell, waist * swell * m.dpi);
     }
 
     /// A fixed theme, or a dark shade of the wallpaper's average colour.
     /// Glass needs a fresh blurred wallpaper; the other styles don't keep one.
     fn apply_style(&self, style: &str) {
         unsafe {
-            if style == "glass" && pretty::is_on() {
-                if let Err(e) = pretty::load_backdrop(GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) {
+            if matches!(style, "glass" | "liquid") && pretty::is_on() {
+                if let Err(e) = pretty::load_backdrop(GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), style == "liquid") {
                     log(&format!("glass unavailable, using the smooth look: {e}"));
                     pretty::drop_backdrop();
                 }
@@ -795,6 +798,7 @@ impl Sections {
         let m = plan.m;
         layers::set_accent(plan.colour(&plan.groups[at].0));
         let right = plan.cfg.right_side;
+        let liquid = plan.cfg.style == "liquid";
         let seed = Rect { x: full.x, y: (plan.pill_mid(at) - m.pill_h / 2).clamp(m.gap, plan.room.1 - m.pill_h), w: m.pill_h, h: m.pill_h };
         let rows = (icons.len() as i32 + across - 1) / across;
         let (open_time, close_time) = speed_times(&plan.cfg.speed);
@@ -818,10 +822,12 @@ impl Sections {
             let progress = if opening { t } else { 1.0 - t };
             // the last frame lands exactly on full size, which is what tells Pretty mode it has stopped
             let shape = if opening && t >= 1.0 { 1.0 } else if opening { spring(progress) } else { ease_out(progress) };
-            let w = mix(seed.w, full.w, shape);
+            // liquid wobbles: height and width settle out of step
+            let (shape_w, shape_h) = if liquid && opening && t < 1.0 { jelly(progress) } else { (shape, shape) };
+            let w = mix(seed.w, full.w, shape_w);
             // the edge facing the rail stays put; the panel grows away from it
             let x = if right { full.x + full.w - w } else { full.x };
-            let r = Rect { x, y: mix(seed.y, full.y, shape), w, h: mix(seed.h, full.h, shape) };
+            let r = Rect { x, y: mix(seed.y, full.y, shape_h), w, h: mix(seed.h, full.h, shape_h) };
             self.draw_open(plan, at, r, ease_out((progress * 2.2).min(1.0)));
             if opening {
                 let wanted: Vec<(i32, i32)> = (0..icons.len() as i32)

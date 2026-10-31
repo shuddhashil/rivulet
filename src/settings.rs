@@ -128,9 +128,9 @@ pub fn build(cfg: &Config, login: bool, dpi: f32) -> Vec<Item> {
     b.stepper("Days to look back (0 is off)", "days", cfg.recent_days, 0, 30);
     b.stepper("Most items to show", "limit", cfg.recent_limit as u64, 1, 24);
     b.heading("Look");
-    b.choice("Style", "style", &["Plain", "Smooth", "Glass"], &cfg.style);
+    b.choice("Style", "style", &["Plain", "Smooth", "Glass", "Liquid"], &cfg.style);
     let note = b.rect(MARGIN, WIDTH - 2.0 * MARGIN);
-    b.add(note, Look::Note("Plain uses 2 MB. Smooth and Glass use far more. Leaving Plain applies at next start.".to_string()), None);
+    b.add(note, Look::Note("Plain uses 2 MB; the others use far more. Leaving Plain applies at next start.".to_string()), None);
     b.row += 1;
     let w = (WIDTH - 2.0 * MARGIN - 12.0) / 4.0;
     for (n, (text, action)) in [("Edit rules", Action::EditRules), ("Re-sort", Action::Resort), ("Undo and stop", Action::Undo), ("Stop", Action::Stop)].into_iter().enumerate() {

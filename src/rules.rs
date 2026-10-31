@@ -22,7 +22,7 @@ pub struct Config {
     pub dots: bool,
     pub click_away: bool,
     pub double_click_hide: bool,
-    /// plain, smooth or glass. Anything but plain needs the graphics libraries.
+    /// plain, smooth, glass or liquid. Anything but plain needs the graphics libraries.
     pub style: String,
 }
 
@@ -161,8 +161,8 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
                 "double_click_hide" => cfg.double_click_hide = on_off(&key, value)?,
                 "pretty" => old_pretty = on_off(&key, value)?, // from before there were styles
                 "style" => {
-                    if !matches!(value, "plain" | "smooth" | "glass") {
-                        return Err(format!("sections.ini: style should be plain, smooth or glass: {line}"));
+                    if !matches!(value, "plain" | "smooth" | "glass" | "liquid") {
+                        return Err(format!("sections.ini: style should be plain, smooth, glass or liquid: {line}"));
                     }
                     cfg.style = value.to_string();
                     style_given = true;
@@ -355,6 +355,12 @@ pub fn neck_outline(from: (f32, f32), to: (f32, f32), reach: f32, end_width: f32
 pub fn spring(t: f32) -> f32 {
     1.0 - (-7.0 * t).exp() * (9.0 * t).cos()
 }
+/// Liquid wobble: width and height settle out of step, so the panel squashes and stretches.
+pub fn jelly(t: f32) -> (f32, f32) {
+    let wobble = |t: f32, speed: f32| 1.0 - (-6.0 * t).exp() * (speed * t).cos();
+    (wobble(t, 11.0), wobble((t - 0.07).max(0.0), 13.0))
+}
+
 pub fn ease_out(t: f32) -> f32 {
     1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t)
 }
@@ -421,6 +427,7 @@ mod tests {
         assert_eq!(with("pretty = on"), "smooth"); // the old setting still means what it did
         assert_eq!(with("pretty = on\nstyle = glass"), "glass"); // a chosen style wins, either order
         assert_eq!(with("style = plain\npretty = on"), "plain");
+        assert_eq!(with("style = liquid"), "liquid");
     }
 
     #[test]
@@ -541,6 +548,16 @@ mod tests {
         assert!(width(16) < 6.0);
         let half = neck_outline((0.0, 100.0), (80.0, 20.0), 0.5, 20.0, 4.0);
         assert!(half.iter().all(|(x, _)| *x < 60.0)); // a partial neck stops short
+    }
+
+    #[test]
+    fn jelly_starts_small_wobbles_and_ends_near_full_size() {
+        assert!(jelly(0.0).0.abs() < 0.001);
+        let (w, h) = jelly(1.0);
+        assert!((w - 1.0).abs() < 0.02 && (h - 1.0).abs() < 0.03, "{w} {h}");
+        let peak = (0..=100).map(|i| jelly(i as f32 / 100.0).0).fold(0.0, f32::max);
+        assert!(peak > 1.02 && peak < 1.3, "{peak}");
+        assert!((1..30).any(|i| { let (a, b) = jelly(i as f32 / 100.0); (a - b).abs() > 0.05 })); // out of step
     }
 
     #[test]

@@ -23,14 +23,20 @@ use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 const PARGB: i32 = 0xE200B;
 const UNIT_PIXEL: Unit = 2;
 const FAR_AWAY: f32 = -20000.0;
-/// The blurred wallpaper is kept at one eighth size: blur hides the loss, and memory stays small.
-const SHRINK: i32 = 8;
+/// Frosted glass keeps the wallpaper at one eighth size: heavy blur hides the loss. Liquid glass is
+/// nearly clear, so it keeps far more of the picture and blurs it only slightly.
+const FROSTED_SHRINK: i32 = 8;
+const LIQUID_SHRINK: i32 = 2;
 const BLUR_PASSES: usize = 3;
-const BLUR_RADIUS: i32 = 3;
-const COLOUR_BOOST: f32 = 1.45;
+const FROSTED_BLUR: i32 = 3;
+const LIQUID_BLUR: i32 = 1;
+const FROSTED_BOOST: f32 = 1.45;
+const LIQUID_BOOST: f32 = 1.15;
 
 /// A tiny, blurred copy of the wallpaper, lined up with the screen. Glass shows pieces of it.
 struct Backdrop {
+    liquid: bool,
+    shrink: i32,
     /// The tiny copy, kept alive for GDI+, which draws the neck from it.
     _pixels: Vec<u32>,
     /// The same picture enlarged once to screen size, so each frame only has to copy from it.
@@ -83,11 +89,11 @@ fn blur_rows(from: &[u32], to: &mut [u32], w: i32, h: i32, radius: i32, across: 
 }
 
 /// Three passes of a box blur look like a true soft blur, at a fraction of the cost.
-pub fn blur(pixels: &mut Vec<u32>, w: i32, h: i32) {
+pub fn blur(pixels: &mut Vec<u32>, w: i32, h: i32, radius: i32) {
     let mut other = pixels.clone();
     for _ in 0..BLUR_PASSES {
-        blur_rows(pixels, &mut other, w, h, BLUR_RADIUS, true);
-        blur_rows(&other, pixels, w, h, BLUR_RADIUS, false);
+        blur_rows(pixels, &mut other, w, h, radius, true);
+        blur_rows(&other, pixels, w, h, radius, false);
     }
 }
 
@@ -116,13 +122,14 @@ pub fn edge_info(px: f32, py: f32, w: f32, h: f32, radius: f32) -> (f32, f32, f3
 }
 
 /// Make the tiny blurred wallpaper. Called on start and whenever the wallpaper changes.
-pub unsafe fn load_backdrop(screen_w: i32, screen_h: i32) -> Result<(), String> {
+pub unsafe fn load_backdrop(screen_w: i32, screen_h: i32, liquid: bool) -> Result<(), String> {
+    let (shrink, radius, boost) = if liquid { (LIQUID_SHRINK, LIQUID_BLUR, LIQUID_BOOST) } else { (FROSTED_SHRINK, FROSTED_BLUR, FROSTED_BOOST) };
     let path = crate::wallpaper::picture_path().ok_or("no wallpaper picture found")?;
     let mut image = std::ptr::null_mut();
     if GdipLoadImageFromFile(wide(&path.to_string_lossy()).as_ptr(), &mut image) != 0 {
         return Err("the wallpaper would not load".into());
     }
-    let (w, h) = ((screen_w / SHRINK).max(2), (screen_h / SHRINK).max(2));
+    let (w, h) = ((screen_w / shrink).max(2), (screen_h / shrink).max(2));
     let mut pixels = vec![0u32; (w * h) as usize];
     let (mut bitmap, mut g) = (std::ptr::null_mut(), std::ptr::null_mut());
     GdipCreateBitmapFromScan0(w, h, w * 4, PARGB, pixels.as_mut_ptr() as *mut u8, &mut bitmap);
@@ -138,14 +145,14 @@ pub unsafe fn load_backdrop(screen_w: i32, screen_h: i32) -> Result<(), String> 
     GdipDeleteGraphics(g);
     GdipDisposeImage(image);
     for p in pixels.iter_mut() {
-        *p = boost_colour(*p | 0xFF00_0000, COLOUR_BOOST);
+        *p = boost_colour(*p | 0xFF00_0000, boost);
     }
-    blur(&mut pixels, w, h);
+    blur(&mut pixels, w, h, radius);
     let mut attributes = std::ptr::null_mut();
     GdipCreateImageAttributes(&mut attributes);
     GdipSetImageAttributesWrapMode(attributes, WrapModeTileFlipXY, 0, 0); // no dark fringe at the screen's edge
     let full = enlarge(&pixels, w, h, screen_w, screen_h);
-    *BACKDROP.lock().unwrap() = Some(Backdrop { _pixels: pixels, full, full_w: screen_w, full_h: screen_h, bitmap, attributes });
+    *BACKDROP.lock().unwrap() = Some(Backdrop { liquid, shrink, _pixels: pixels, full, full_w: screen_w, full_h: screen_h, bitmap, attributes });
     Ok(())
 }
 
@@ -159,6 +166,10 @@ fn has_glass() -> bool {
     BACKDROP.lock().map(|b| b.is_some()).unwrap_or(false)
 }
 
+fn has_liquid() -> bool {
+    BACKDROP.lock().map(|b| b.as_ref().is_some_and(|b| b.liquid)).unwrap_or(false)
+}
+
 /// Show the blurred wallpaper through this shape. x and y place the shape on the page; sx and sy
 /// say where that page spot is on the screen.
 unsafe fn paint_backdrop(g: *mut GpGraphics, shape: *mut GpPath, x: f32, y: f32, w: f32, h: f32, sx: f32, sy: f32) {
@@ -167,7 +178,7 @@ unsafe fn paint_backdrop(g: *mut GpGraphics, shape: *mut GpPath, x: f32, y: f32,
     GdipSetClipPath(g, shape, CombineModeReplace);
     GdipSetInterpolationMode(g, InterpolationModeBilinear);
     GdipSetPixelOffsetMode(g, PixelOffsetModeHalf);
-    let s = SHRINK as f32;
+    let s = b.shrink as f32;
     GdipDrawImageRectRect(g, b.bitmap as _, x, y, w, h, sx / s, sy / s, w / s, h / s, UNIT_PIXEL, b.attributes, 0, std::ptr::null_mut());
     GdipResetClip(g);
 }
@@ -245,6 +256,9 @@ unsafe fn fill_frosted(page: &mut Page, x: i32, y: i32, w: i32, h: i32, radius: 
     }
 }
 
+/// Where the light comes from, as a direction: up and to the left.
+const LIGHT: (f32, f32) = (-0.55, -0.83);
+
 /// The liquid edge: near the rim, the picture is pulled inward as a thick lens would, and brightens
 /// where the curve catches the light. It fades into what is already there, so no seam shows, and
 /// it is worked out pixel by pixel, so only once a panel is at rest.
@@ -278,14 +292,79 @@ unsafe fn bend_rim(page: &mut Page, x: i32, y: i32, w: i32, h: i32, radius: f32,
             let sample_y = (sy as f32 + cy - ny * bend) as i32;
             let s = b.full[(sample_y.clamp(0, b.full_h - 1) * b.full_w + sample_x.clamp(0, b.full_w - 1)) as usize];
             let fade = closeness * closeness * (3.0 - 2.0 * closeness); // nothing at the inner edge, full at the rim
-            let lift = 1.0 + 0.28 * closeness * closeness;
             let cover = coverage as f32 / 255.0;
+            if b.liquid {
+                // a real lens splits colours a little, red bending least and blue most
+                let read = |amount: f32, shift: u32| {
+                    let qx = (sx as f32 + cx - nx * bend * amount) as i32;
+                    let qy = (sy as f32 + cy - ny * bend * amount) as i32;
+                    ((b.full[(qy.clamp(0, b.full_h - 1) * b.full_w + qx.clamp(0, b.full_w - 1)) as usize] >> shift) & 255) as f32
+                };
+                // light from the top left, with a fainter bounce on the far side
+                let facing = nx * LIGHT.0 + ny * LIGHT.1;
+                let glint = (facing.max(0.0).powi(3) + (-facing).max(0.0).powi(3) * 0.45) * closeness.powi(5) * 235.0
+                    + facing.max(0.0) * closeness * closeness * 26.0;
+                let finish = |amount: f32, shift: u32| {
+                    let bent = (read(amount, shift) + glint) * cover;
+                    let now = ((here >> shift) & 255) as f32;
+                    ((now + (bent - now) * fade).clamp(0.0, 255.0) as u32) << shift
+                };
+                page.pixels[index] = (coverage << 24) | finish(0.94, 16) | finish(1.0, 8) | finish(1.07, 0);
+                continue;
+            }
+            let lift = 1.0 + 0.28 * closeness * closeness;
             let finish = |shift: u32| {
                 let bent = ((s >> shift) & 255) as f32 * lift * cover;
                 let now = ((here >> shift) & 255) as f32;
                 ((now + (bent - now) * fade * 0.8).clamp(0.0, 255.0) as u32) << shift
             };
             page.pixels[index] = (coverage << 24) | finish(16) | finish(8) | finish(0);
+        }
+    }
+}
+
+/// The neck as a glass tube: each column is bent toward its own centre line, strongest at the walls.
+/// `outline` is the neck's shape on this page; its first half runs along one wall and its second
+/// half back along the other.
+unsafe fn bend_neck(page: &mut Page, outline: &[PointF], sx: i32, sy: i32, tint: u32) {
+    let Ok(guard) = BACKDROP.lock() else { return };
+    let Some(b) = guard.as_ref() else { return };
+    let pairs = outline.len() / 2;
+    if pairs < 2 {
+        return;
+    }
+    let (tr, tg, tb) = parts(tint);
+    let mut centre = vec![(0.0f32, 0.0f32); page.w as usize];
+    let mut known = vec![false; page.w as usize];
+    for i in 0..pairs {
+        let (a, c) = (outline[i], outline[outline.len() - 1 - i]);
+        let column = (((a.X + c.X) / 2.0) as i32).clamp(0, page.w - 1) as usize;
+        centre[column] = ((a.Y + c.Y) / 2.0, (((a.X - c.X).powi(2) + (a.Y - c.Y).powi(2)).sqrt() / 2.0).max(1.0));
+        known[column] = true;
+    }
+    let mut last = None;
+    for column in 0..page.w as usize {
+        if known[column] {
+            last = Some(centre[column]);
+        } else if let Some(v) = last {
+            centre[column] = v;
+        }
+    }
+    for y in 0..page.h {
+        for x in 0..page.w {
+            let index = (y * page.w + x) as usize;
+            let coverage = page.pixels[index] >> 24;
+            if coverage == 0 {
+                continue;
+            }
+            let (mid, half) = centre[x as usize];
+            let across = ((y as f32 + 0.5 - mid) / half).clamp(-1.0, 1.0);
+            let bend = across * across * across * half * 2.4;
+            let s = b.full[((sy + y - bend as i32).clamp(0, b.full_h - 1) * b.full_w + (sx + x).clamp(0, b.full_w - 1)) as usize];
+            let glint = if across < 0.0 { (-across).powi(6) * 150.0 } else { across.powi(6) * 55.0 };
+            let cover = coverage as f32 / 255.0;
+            let mixed = |shift: u32, t: u32| ((((((s >> shift) & 255) as f32) * 0.76 + t as f32 * 0.24 + glint).min(255.0) * cover) as u32) << shift;
+            page.pixels[index] = (coverage << 24) | mixed(16, tr) | mixed(8, tg) | mixed(0, tb);
         }
     }
 }
@@ -564,7 +643,18 @@ impl Engine {
                         }
                     }
                 }
-                let mut c = PlusCanvas { g: page.g, dpi: self.dpi, alpha: if glass { 150 } else { 225 } };
+                let liquid = has_liquid();
+                if liquid {
+                    let band = 9.0 * self.dpi;
+                    if let Ok(pills) = layers::PILLS.lock() {
+                        for p in pills.iter() {
+                            let r = p.rect;
+                            let (sx, sy) = (self.origin.0 + (x + r.left) as f32, self.origin.1 + (y + r.top) as f32);
+                            bend_rim(page, r.left, r.top, r.right - r.left, r.bottom - r.top, 7.0 * self.dpi, sx as i32, sy as i32, band);
+                        }
+                    }
+                }
+                let mut c = PlusCanvas { g: page.g, dpi: self.dpi, alpha: if liquid { 112 } else if glass { 150 } else { 225 } };
                 layers::paint_rail_on(&mut c, self.dpi, layers::pill_tint());
                 if glass {
                     if let Ok(pills) = layers::PILLS.lock() {
@@ -591,11 +681,11 @@ mod tests {
     #[test]
     fn blur_keeps_flat_colour_flat_and_softens_a_spike() {
         let mut flat = vec![0xFF40_6080u32; 100];
-        blur(&mut flat, 10, 10);
+        blur(&mut flat, 10, 10, 3);
         assert!(flat.iter().all(|p| *p == 0xFF40_6080));
         let mut spike = vec![0xFF00_0000u32; 49 * 49];
         spike[24 * 49 + 24] = 0xFFFF_FFFF;
-        blur(&mut spike, 49, 49);
+        blur(&mut spike, 49, 49, 3);
         let centre = spike[24 * 49 + 24] & 255;
         assert!(centre < 255 && spike[24 * 49 + 25] & 255 <= centre);
     }
@@ -694,9 +784,12 @@ pub unsafe fn set_panel(x: i32, y: i32, w: i32, h: i32, radius: i32) {
 
             let settings = layers::settings_showing();
             let frosted = has_glass();
+            let liquid = has_liquid();
             let (shade, accent, pill) = (layers::panel_tint(), layers::accent(), layers::pill_tint());
             // real glass lets more through; text on Settings still has to stay easy to read
             let alpha = match (frosted, settings) {
+                (true, true) if liquid => 178,
+                (true, false) if liquid => 42,
                 (true, true) => 205,
                 (true, false) => 120,
                 (false, true) => 244,
@@ -707,10 +800,16 @@ pub unsafe fn set_panel(x: i32, y: i32, w: i32, h: i32, radius: i32) {
             if frosted {
                 let (sx, sy) = ((e.origin.0 + x as f32) as i32, (e.origin.1 + y as f32) as i32);
                 fill_frosted(page, shadow, shadow, w, h, d / 2.0, sx, sy, top, bottom, alpha);
-                if e.panel_size == (w, h) {
-                    bend_rim(page, shadow, shadow, w, h, d / 2.0, sx, sy, 20.0 * dpi);
+                // liquid glass keeps bending while it moves; frosted glass waits until it rests
+                if liquid {
+                    bend_rim(page, shadow, shadow, w, h, d / 2.0, sx, sy, (30.0 * dpi).min(h as f32 / 2.0).min(w as f32 / 2.0));
+                    rim_light(g, body, fx, fy, fw, fh, dpi, 90);
+                } else {
+                    if e.panel_size == (w, h) {
+                        bend_rim(page, shadow, shadow, w, h, d / 2.0, sx, sy, 20.0 * dpi);
+                    }
+                    rim_light(g, body, fx, fy, fw, fh, 1.3 * dpi, 215);
                 }
-                rim_light(g, body, fx, fy, fw, fh, 1.3 * dpi, 215);
             } else {
                 let area = RectF { X: fx, Y: fy, Width: fw, Height: fh + 1.0 };
                 let mut glass = std::ptr::null_mut();
@@ -752,17 +851,25 @@ pub unsafe fn set_neck(from: (i32, i32), to: (i32, i32), reach: f32, end_width: 
             page.clear();
             let points: Vec<PointF> = outline.iter().map(|&(x, y)| PointF { X: x - left as f32, Y: y - top as f32 }).collect();
             let frosted = has_glass();
-            if frosted {
+            if has_liquid() {
+                let mut brush = std::ptr::null_mut();
+                GdipCreateSolidFill(0xFFFFFFFF, &mut brush);
+                GdipFillPolygon(page.g, brush as _, points.as_ptr(), points.len() as i32, FillModeWinding);
+                GdipDeleteBrush(brush as _);
+                bend_neck(page, &points, (e.origin.0 + left as f32) as i32, (e.origin.1 + top as f32) as i32, colour);
+            } else if frosted {
                 let mut shape = std::ptr::null_mut();
                 GdipCreatePath(FillModeWinding, &mut shape);
                 GdipAddPathPolygon(shape, points.as_ptr(), points.len() as i32);
                 paint_backdrop(page.g, shape, 0.0, 0.0, w as f32, h as f32, e.origin.0 + left as f32, e.origin.1 + top as f32);
                 GdipDeletePath(shape);
             }
-            let mut brush = std::ptr::null_mut();
-            GdipCreateSolidFill(argb(colour, if frosted { 150 } else { 235 }), &mut brush);
-            GdipFillPolygon(page.g, brush as _, points.as_ptr(), points.len() as i32, FillModeWinding);
-            GdipDeleteBrush(brush as _);
+            if !has_liquid() {
+                let mut brush = std::ptr::null_mut();
+                GdipCreateSolidFill(argb(colour, if frosted { 150 } else { 235 }), &mut brush);
+                GdipFillPolygon(page.g, brush as _, points.as_ptr(), points.len() as i32, FillModeWinding);
+                GdipDeleteBrush(brush as _);
+            }
         }
         e.show(&neck, left as f32, top as f32);
     }
