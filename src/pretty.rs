@@ -8,9 +8,12 @@ use crate::rules::{blend, neck_outline};
 use crate::wallpaper::wide;
 use std::ffi::c_void;
 use std::result::Result::Ok; // GdiPlus also defines a constant called Ok
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use windows::core::{Interface, GUID, HRESULT};
-use windows::Win32::Foundation::HWND as ComHwnd;
+use windows::Win32::Foundation::{FreeLibrary, HWND as ComHwnd, RECT as ComRect};
+use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::DirectComposition::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -23,19 +26,18 @@ use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 const PARGB: i32 = 0xE200B;
 const UNIT_PIXEL: Unit = 2;
 const FAR_AWAY: f32 = -20000.0;
-/// Frosted glass keeps the wallpaper at one eighth size: heavy blur hides the loss. Liquid glass is
-/// nearly clear, so it keeps far more of the picture and blurs it only slightly.
+/// Frosted glass keeps the wallpaper at one eighth size: heavy blur hides the loss. Liquid glass
+/// hands the graphics card the full picture and blurs it there.
 const FROSTED_SHRINK: i32 = 8;
-const LIQUID_SHRINK: i32 = 2;
 const BLUR_PASSES: usize = 3;
 const FROSTED_BLUR: i32 = 3;
-const LIQUID_BLUR: i32 = 1;
 const FROSTED_BOOST: f32 = 1.45;
-const LIQUID_BOOST: f32 = 1.15;
 
 /// A tiny, blurred copy of the wallpaper, lined up with the screen. Glass shows pieces of it.
 struct Backdrop {
     liquid: bool,
+    /// What the shader draws: 0 liquid, 1 aurora, 2 neon.
+    look: f32,
     shrink: i32,
     /// The tiny copy, kept alive for GDI+, which draws the neck from it.
     _pixels: Vec<u32>,
@@ -121,9 +123,44 @@ pub fn edge_info(px: f32, py: f32, w: f32, h: f32, radius: f32) -> (f32, f32, f3
     }
 }
 
+/// Where the wallpaper's picture goes on a screen, under each of Windows' placement settings, as
+/// (screen rectangle, picture rectangle) pairs. Tile needs many pieces.
+pub fn wallpaper_pieces(setting: &str, iw: f32, ih: f32, sw: f32, sh: f32) -> Vec<((f32, f32, f32, f32), (f32, f32, f32, f32))> {
+    let whole = (0.0, 0.0, iw, ih);
+    match setting {
+        "stretch" => vec![((0.0, 0.0, sw, sh), whole)],
+        "fit" => {
+            let k = (sw / iw).min(sh / ih);
+            vec![(((sw - iw * k) / 2.0, (sh - ih * k) / 2.0, iw * k, ih * k), whole)]
+        }
+        "center" => vec![(((sw - iw) / 2.0, (sh - ih) / 2.0, iw, ih), whole)],
+        "tile" => {
+            let mut out = vec![];
+            let mut y = 0.0;
+            while y < sh {
+                let mut x = 0.0;
+                while x < sw {
+                    out.push(((x, y, iw, ih), whole));
+                    x += iw.max(1.0);
+                }
+                y += ih.max(1.0);
+            }
+            out
+        }
+        _ => {
+            // Fill: cover the screen, trim the overflow evenly
+            let k = (sw / iw).max(sh / ih);
+            let (cw, ch) = (sw / k, sh / k);
+            vec![((0.0, 0.0, sw, sh), ((iw - cw) / 2.0, (ih - ch) / 2.0, cw, ch))]
+        }
+    }
+}
+
 /// Make the tiny blurred wallpaper. Called on start and whenever the wallpaper changes.
-pub unsafe fn load_backdrop(screen_w: i32, screen_h: i32, liquid: bool) -> Result<(), String> {
-    let (shrink, radius, boost) = if liquid { (LIQUID_SHRINK, LIQUID_BLUR, LIQUID_BOOST) } else { (FROSTED_SHRINK, FROSTED_BLUR, FROSTED_BOOST) };
+pub unsafe fn load_backdrop(screen_w: i32, screen_h: i32, shader_look: Option<f32>) -> Result<(), String> {
+    let shader_look = shader_look.filter(|_| gpu_ready());
+    let liquid = shader_look.is_some();
+    let shrink = if liquid { 1 } else { FROSTED_SHRINK };
     let path = crate::wallpaper::picture_path().ok_or("no wallpaper picture found")?;
     let mut image = std::ptr::null_mut();
     if GdipLoadImageFromFile(wide(&path.to_string_lossy()).as_ptr(), &mut image) != 0 {
@@ -135,24 +172,35 @@ pub unsafe fn load_backdrop(screen_w: i32, screen_h: i32, liquid: bool) -> Resul
     GdipCreateBitmapFromScan0(w, h, w * 4, PARGB, pixels.as_mut_ptr() as *mut u8, &mut bitmap);
     GdipGetImageGraphicsContext(bitmap as _, &mut g);
     GdipSetInterpolationMode(g, InterpolationModeHighQualityBicubic);
-    // the same crop as Windows' Fill setting: cover the screen, trim the overflow evenly
     let (mut iw, mut ih) = (0u32, 0u32);
     GdipGetImageWidth(image, &mut iw);
     GdipGetImageHeight(image, &mut ih);
-    let scale = (screen_w as f32 / iw as f32).max(screen_h as f32 / ih as f32);
-    let (sw, sh) = (screen_w as f32 / scale, screen_h as f32 / scale);
-    GdipDrawImageRectRect(g, image, 0.0, 0.0, w as f32, h as f32, (iw as f32 - sw) / 2.0, (ih as f32 - sh) / 2.0, sw, sh, UNIT_PIXEL, std::ptr::null_mut(), 0, std::ptr::null_mut());
+    // the empty part of a Fit or Center wallpaper shows Windows' background colour
+    pixels.fill(0xFF00_0000 | crate::wallpaper::background_colour());
+    let setting = crate::wallpaper::placement_setting();
+    let k = 1.0 / shrink as f32;
+    for (to, from) in wallpaper_pieces(&setting, iw as f32, ih as f32, screen_w as f32, screen_h as f32) {
+        GdipDrawImageRectRect(g, image, to.0 * k, to.1 * k, to.2 * k, to.3 * k, from.0, from.1, from.2, from.3, UNIT_PIXEL, std::ptr::null_mut(), 0, std::ptr::null_mut());
+    }
     GdipDeleteGraphics(g);
     GdipDisposeImage(image);
-    for p in pixels.iter_mut() {
-        *p = boost_colour(*p | 0xFF00_0000, boost);
+    if !liquid {
+        for p in pixels.iter_mut() {
+            *p = boost_colour(*p | 0xFF00_0000, FROSTED_BOOST);
+        }
+        blur(&mut pixels, w, h, FROSTED_BLUR);
     }
-    blur(&mut pixels, w, h, radius);
     let mut attributes = std::ptr::null_mut();
     GdipCreateImageAttributes(&mut attributes);
     GdipSetImageAttributesWrapMode(attributes, WrapModeTileFlipXY, 0, 0); // no dark fringe at the screen's edge
-    let full = enlarge(&pixels, w, h, screen_w, screen_h);
-    *BACKDROP.lock().unwrap() = Some(Backdrop { liquid, shrink, _pixels: pixels, full, full_w: screen_w, full_h: screen_h, bitmap, attributes });
+    // liquid only reads the picture itself, so it needs no enlarged copy
+    let full = if liquid { Vec::new() } else { enlarge(&pixels, w, h, screen_w, screen_h) };
+    *BACKDROP.lock().unwrap() = Some(Backdrop { liquid, look: shader_look.unwrap_or(0.0), shrink, _pixels: pixels, full, full_w: screen_w, full_h: screen_h, bitmap, attributes });
+    if let Ok(mut engine) = ENGINE.lock() {
+        if let Some(g) = engine.as_mut().and_then(|e| e.gpu.as_mut()) {
+            g.wall = None; // made again from the new picture when next drawn
+        }
+    }
     Ok(())
 }
 
@@ -164,10 +212,6 @@ pub fn drop_backdrop() {
 
 fn has_glass() -> bool {
     BACKDROP.lock().map(|b| b.is_some()).unwrap_or(false)
-}
-
-fn has_liquid() -> bool {
-    BACKDROP.lock().map(|b| b.as_ref().is_some_and(|b| b.liquid)).unwrap_or(false)
 }
 
 /// Show the blurred wallpaper through this shape. x and y place the shape on the page; sx and sy
@@ -256,10 +300,7 @@ unsafe fn fill_frosted(page: &mut Page, x: i32, y: i32, w: i32, h: i32, radius: 
     }
 }
 
-/// Where the light comes from, as a direction: up and to the left.
-const LIGHT: (f32, f32) = (-0.55, -0.83);
-
-/// The liquid edge: near the rim, the picture is pulled inward as a thick lens would, and brightens
+/// The glass edge: near the rim, the picture is pulled inward as a thick lens would, and brightens
 /// where the curve catches the light. It fades into what is already there, so no seam shows, and
 /// it is worked out pixel by pixel, so only once a panel is at rest.
 unsafe fn bend_rim(page: &mut Page, x: i32, y: i32, w: i32, h: i32, radius: f32, sx: i32, sy: i32, band: f32) {
@@ -293,25 +334,6 @@ unsafe fn bend_rim(page: &mut Page, x: i32, y: i32, w: i32, h: i32, radius: f32,
             let s = b.full[(sample_y.clamp(0, b.full_h - 1) * b.full_w + sample_x.clamp(0, b.full_w - 1)) as usize];
             let fade = closeness * closeness * (3.0 - 2.0 * closeness); // nothing at the inner edge, full at the rim
             let cover = coverage as f32 / 255.0;
-            if b.liquid {
-                // a real lens splits colours a little, red bending least and blue most
-                let read = |amount: f32, shift: u32| {
-                    let qx = (sx as f32 + cx - nx * bend * amount) as i32;
-                    let qy = (sy as f32 + cy - ny * bend * amount) as i32;
-                    ((b.full[(qy.clamp(0, b.full_h - 1) * b.full_w + qx.clamp(0, b.full_w - 1)) as usize] >> shift) & 255) as f32
-                };
-                // light from the top left, with a fainter bounce on the far side
-                let facing = nx * LIGHT.0 + ny * LIGHT.1;
-                let glint = (facing.max(0.0).powi(3) + (-facing).max(0.0).powi(3) * 0.45) * closeness.powi(5) * 235.0
-                    + facing.max(0.0) * closeness * closeness * 26.0;
-                let finish = |amount: f32, shift: u32| {
-                    let bent = (read(amount, shift) + glint) * cover;
-                    let now = ((here >> shift) & 255) as f32;
-                    ((now + (bent - now) * fade).clamp(0.0, 255.0) as u32) << shift
-                };
-                page.pixels[index] = (coverage << 24) | finish(0.94, 16) | finish(1.0, 8) | finish(1.07, 0);
-                continue;
-            }
             let lift = 1.0 + 0.28 * closeness * closeness;
             let finish = |shift: u32| {
                 let bent = ((s >> shift) & 255) as f32 * lift * cover;
@@ -319,52 +341,6 @@ unsafe fn bend_rim(page: &mut Page, x: i32, y: i32, w: i32, h: i32, radius: f32,
                 ((now + (bent - now) * fade * 0.8).clamp(0.0, 255.0) as u32) << shift
             };
             page.pixels[index] = (coverage << 24) | finish(16) | finish(8) | finish(0);
-        }
-    }
-}
-
-/// The neck as a glass tube: each column is bent toward its own centre line, strongest at the walls.
-/// `outline` is the neck's shape on this page; its first half runs along one wall and its second
-/// half back along the other.
-unsafe fn bend_neck(page: &mut Page, outline: &[PointF], sx: i32, sy: i32, tint: u32) {
-    let Ok(guard) = BACKDROP.lock() else { return };
-    let Some(b) = guard.as_ref() else { return };
-    let pairs = outline.len() / 2;
-    if pairs < 2 {
-        return;
-    }
-    let (tr, tg, tb) = parts(tint);
-    let mut centre = vec![(0.0f32, 0.0f32); page.w as usize];
-    let mut known = vec![false; page.w as usize];
-    for i in 0..pairs {
-        let (a, c) = (outline[i], outline[outline.len() - 1 - i]);
-        let column = (((a.X + c.X) / 2.0) as i32).clamp(0, page.w - 1) as usize;
-        centre[column] = ((a.Y + c.Y) / 2.0, (((a.X - c.X).powi(2) + (a.Y - c.Y).powi(2)).sqrt() / 2.0).max(1.0));
-        known[column] = true;
-    }
-    let mut last = None;
-    for column in 0..page.w as usize {
-        if known[column] {
-            last = Some(centre[column]);
-        } else if let Some(v) = last {
-            centre[column] = v;
-        }
-    }
-    for y in 0..page.h {
-        for x in 0..page.w {
-            let index = (y * page.w + x) as usize;
-            let coverage = page.pixels[index] >> 24;
-            if coverage == 0 {
-                continue;
-            }
-            let (mid, half) = centre[x as usize];
-            let across = ((y as f32 + 0.5 - mid) / half).clamp(-1.0, 1.0);
-            let bend = across * across * across * half * 2.4;
-            let s = b.full[((sy + y - bend as i32).clamp(0, b.full_h - 1) * b.full_w + (sx + x).clamp(0, b.full_w - 1)) as usize];
-            let glint = if across < 0.0 { (-across).powi(6) * 150.0 } else { across.powi(6) * 55.0 };
-            let cover = coverage as f32 / 255.0;
-            let mixed = |shift: u32, t: u32| ((((((s >> shift) & 255) as f32) * 0.76 + t as f32 * 0.24 + glint).min(255.0) * cover) as u32) << shift;
-            page.pixels[index] = (coverage << 24) | mixed(16, tr) | mixed(8, tg) | mixed(0, tb);
         }
     }
 }
@@ -438,9 +414,17 @@ struct PlusCanvas {
     g: *mut GpGraphics,
     dpi: f32,
     alpha: u8,
+    /// Liquid: the card draws the labels' glass, and words get a soft shadow to stand out on it.
+    liquid: bool,
 }
 
 impl Canvas for PlusCanvas {
+    fn pill(&mut self, r: RECT, radius: i32, colour: u32) {
+        if !self.liquid {
+            self.fill(r, radius, colour);
+        }
+    }
+
     fn fill(&mut self, r: RECT, radius: i32, colour: u32) {
         unsafe {
             let mut brush = std::ptr::null_mut();
@@ -477,6 +461,17 @@ impl Canvas for PlusCanvas {
                 GdipSetStringFormatTrimming(format, StringTrimmingEllipsisCharacter);
             }
             let area = RectF { X: r.left as f32, Y: r.top as f32, Width: (r.right - r.left) as f32, Height: (r.bottom - r.top) as f32 };
+            if self.liquid {
+                let mut dark = std::ptr::null_mut();
+                GdipCreateSolidFill(0x58000000, &mut dark);
+                let small_text = matches!(style, Style::Small);
+                let offsets: &[(f32, f32)] = if small_text { &[(0.0, 1.0)] } else { &[(0.0, 1.0), (1.0, 1.0)] };
+                for &(dx, dy) in offsets {
+                    let under = RectF { X: area.X + dx * self.dpi, Y: area.Y + dy * self.dpi, ..area };
+                    GdipDrawString(self.g, wide(s).as_ptr(), -1, font, &under, format, dark as _);
+                }
+                GdipDeleteBrush(dark as _);
+            }
             GdipDrawString(self.g, wide(s).as_ptr(), -1, font, &area, format, brush as _);
             GdipDeleteStringFormat(format);
             GdipDeleteBrush(brush as _);
@@ -491,6 +486,55 @@ struct Sprite {
     visual: IDCompositionVisual,
     swap: Option<IDXGISwapChain1>,
     page: Option<Page>,
+    /// Liquid: the page's words, as a picture the graphics card can lay over the glass.
+    words: Option<(ID3D11Texture2D, ID3D11ShaderResourceView)>,
+}
+
+/// The numbers `liquid.hlsl` reads. Sixteen floats to a line is how the card wants them.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Glass {
+    box_: [f32; 4],
+    shape: [f32; 4],
+    tint: [f32; 4],
+    place: [f32; 4],
+    mouse: [f32; 4],
+    neck0: [f32; 4],
+    neck1: [f32; 4],
+    neck2: [f32; 4],
+    pill: [f32; 4],
+    look: [f32; 4],
+    glow: [f32; 4],
+}
+
+/// What the card needs to draw liquid glass.
+struct Gpu {
+    vertex: ID3D11VertexShader,
+    glass: ID3D11PixelShader,
+    words: ID3D11PixelShader,
+    numbers: ID3D11Buffer,
+    sampler: ID3D11SamplerState,
+    over: ID3D11BlendState,
+    clip: ID3D11RasterizerState,
+    wall: Option<ID3D11ShaderResourceView>,
+}
+
+#[derive(Clone, Copy)]
+struct Panel {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    radius: i32,
+}
+
+#[derive(Clone, Copy)]
+struct Neck {
+    from: (i32, i32),
+    to: (i32, i32),
+    reach: f32,
+    end_width: f32,
+    mid_width: f32,
 }
 
 struct Engine {
@@ -508,6 +552,12 @@ struct Engine {
     origin: (f32, f32),
     dpi: f32,
     _gdiplus: usize,
+    gpu: Option<Gpu>,
+    open_panel: Option<(Panel, Neck)>,
+    waiting_panel: Option<Panel>,
+    rail_showing: bool,
+    /// Where the mouse is, on this window, and how much it leads the light.
+    mouse: (f32, f32, f32),
 }
 
 /// Only ever touched behind the mutex below, one thread at a time.
@@ -520,6 +570,8 @@ pub fn is_on() -> bool {
 }
 
 pub fn stop() {
+    LIGHT_WANTED.store(false, Ordering::Relaxed);
+    DRIFTING.store(false, Ordering::Relaxed);
     if let Ok(mut e) = ENGINE.lock() {
         *e = None;
     }
@@ -567,16 +619,19 @@ pub unsafe fn start(window: HWND, dpi: f32) -> Result<(), String> {
 
     let target = dcomp.CreateTargetForHwnd(ComHwnd(window), true).map_err(text)?;
     let root = dcomp.CreateVisual().map_err(text)?;
-    let sprite = |dcomp: &IDCompositionDevice| -> Result<Sprite, String> {
+    let sprite = |dcomp: &IDCompositionDevice, below: Option<&IDCompositionVisual>| -> Result<Sprite, String> {
         let visual = dcomp.CreateVisual().map_err(text)?;
-        root.AddVisual(&visual, true, None).map_err(text)?;
+        match below {
+            Some(under) => root.AddVisual(&visual, true, under).map_err(text)?,
+            None => root.AddVisual(&visual, false, None).map_err(text)?,
+        }
         visual.SetOffsetX2(FAR_AWAY).map_err(text)?;
-        Ok(Sprite { visual, swap: None, page: None })
+        Ok(Sprite { visual, swap: None, page: None, words: None })
     };
-    // each is added on top, so the order here is the stacking order
-    let panel = sprite(&dcomp)?;
-    let neck = sprite(&dcomp)?;
-    let rail = sprite(&dcomp)?;
+    // bottom to top: named outright, as the rail must cover the part of the panel melted into it
+    let panel = sprite(&dcomp, None)?;
+    let neck = sprite(&dcomp, Some(&panel.visual))?;
+    let rail = sprite(&dcomp, Some(&neck.visual))?;
     target.SetRoot(&root).map_err(text)?;
     dcomp.Commit().map_err(text)?;
 
@@ -584,8 +639,191 @@ pub unsafe fn start(window: HWND, dpi: f32) -> Result<(), String> {
     if GdiplusStartup(&mut token, &input, std::ptr::null_mut()) != 0 {
         return Err("GDI+ would not start".into());
     }
-    *ENGINE.lock().unwrap() = Some(Engine { device, context, factory, dcomp, _target: target, rail, panel, neck, rail_rect: (0, 0, 1, 1), panel_size: (0, 0), origin: window_origin(window), dpi, _gdiplus: token });
+    let gpu = match make_gpu(&device) {
+        Ok(g) => Some(g),
+        Err(why) => {
+            crate::log(&format!("liquid unavailable, it will look like Glass: {why}"));
+            None
+        }
+    };
+    LIGHT_WANTED.store(false, Ordering::Relaxed);
+    *ENGINE.lock().unwrap() = Some(Engine { device, context, factory, dcomp, _target: target, rail, panel, neck, rail_rect: (0, 0, 1, 1), panel_size: (0, 0), origin: window_origin(window), dpi, _gdiplus: token, gpu, open_panel: None, waiting_panel: None, rail_showing: false, mouse: (0.0, 0.0, 0.0) });
     Ok(())
+}
+
+/// Turn the shader's text into code for the card. The compiler is a large library, so it is loaded
+/// only for this and let go straight after.
+unsafe fn compile(source: &str, entry: &[u8], target: &[u8]) -> Result<Vec<u8>, String> {
+    type Compile = unsafe extern "system" fn(*const c_void, usize, *const u8, *const c_void, *const c_void, *const u8, *const u8, u32, u32, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
+    let name = wide("d3dcompiler_47.dll");
+    let module = LoadLibraryW(name.as_ptr());
+    if module.is_null() {
+        return Err("d3dcompiler_47.dll is missing".into());
+    }
+    let answer = (|| {
+        let function = GetProcAddress(module, b"D3DCompile\0".as_ptr()).ok_or("the shader compiler is missing a function")?;
+        let function: Compile = std::mem::transmute(function);
+        let (mut code, mut errors) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let result = function(source.as_ptr() as _, source.len(), std::ptr::null(), std::ptr::null(), std::ptr::null(), entry.as_ptr(), target.as_ptr(), 0, 0, &mut code, &mut errors);
+        if result.is_err() {
+            if errors.is_null() {
+                return Err(format!("shader failed: {result:?}"));
+            }
+            let errors = ID3DBlob::from_raw(errors);
+            let text = std::slice::from_raw_parts(errors.GetBufferPointer() as *const u8, errors.GetBufferSize());
+            return Err(String::from_utf8_lossy(text).into_owned());
+        }
+        if !errors.is_null() {
+            drop(ID3DBlob::from_raw(errors));
+        }
+        // copied out, as the blob's own code goes away with the library below
+        let code = ID3DBlob::from_raw(code);
+        Ok(std::slice::from_raw_parts(code.GetBufferPointer() as *const u8, code.GetBufferSize()).to_vec())
+    })();
+    let _ = FreeLibrary(windows::Win32::Foundation::HMODULE(module as _));
+    answer
+}
+
+unsafe fn make_gpu(device: &ID3D11Device) -> Result<Gpu, String> {
+    let text = |e: windows::core::Error| e.to_string();
+    let source = include_str!("liquid.hlsl");
+    let vs = compile(source, b"cover_screen\0", b"vs_5_0\0")?;
+    let ps = compile(source, b"glass\0", b"ps_5_0\0")?;
+    let ws = compile(source, b"words\0", b"ps_5_0\0")?;
+    let (mut vertex, mut glass, mut words) = (None, None, None);
+    device.CreateVertexShader(&vs, None, Some(&mut vertex)).map_err(text)?;
+    device.CreatePixelShader(&ps, None, Some(&mut glass)).map_err(text)?;
+    device.CreatePixelShader(&ws, None, Some(&mut words)).map_err(text)?;
+    let mut numbers = None;
+    let desc = D3D11_BUFFER_DESC { ByteWidth: std::mem::size_of::<Glass>() as u32, Usage: D3D11_USAGE_DEFAULT, BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32, ..Default::default() };
+    device.CreateBuffer(&desc, None, Some(&mut numbers)).map_err(text)?;
+    let mut sampler = None;
+    let desc = D3D11_SAMPLER_DESC {
+        Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+        AddressU: D3D11_TEXTURE_ADDRESS_MIRROR,
+        AddressV: D3D11_TEXTURE_ADDRESS_MIRROR,
+        AddressW: D3D11_TEXTURE_ADDRESS_MIRROR,
+        MaxLOD: f32::MAX,
+        ..Default::default()
+    };
+    device.CreateSamplerState(&desc, Some(&mut sampler)).map_err(text)?;
+    let mut blend_desc = D3D11_BLEND_DESC::default();
+    blend_desc.RenderTarget[0] = D3D11_RENDER_TARGET_BLEND_DESC {
+        BlendEnable: true.into(),
+        SrcBlend: D3D11_BLEND_ONE,
+        DestBlend: D3D11_BLEND_INV_SRC_ALPHA,
+        BlendOp: D3D11_BLEND_OP_ADD,
+        SrcBlendAlpha: D3D11_BLEND_ONE,
+        DestBlendAlpha: D3D11_BLEND_INV_SRC_ALPHA,
+        BlendOpAlpha: D3D11_BLEND_OP_ADD,
+        RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
+    };
+    let mut over = None;
+    device.CreateBlendState(&blend_desc, Some(&mut over)).map_err(text)?;
+    let mut clip = None;
+    let desc = D3D11_RASTERIZER_DESC { FillMode: D3D11_FILL_SOLID, CullMode: D3D11_CULL_NONE, ScissorEnable: true.into(), ..Default::default() };
+    device.CreateRasterizerState(&desc, Some(&mut clip)).map_err(text)?;
+    let missing = || "the graphics card returned nothing".to_string();
+    Ok(Gpu {
+        vertex: vertex.ok_or_else(missing)?,
+        glass: glass.ok_or_else(missing)?,
+        words: words.ok_or_else(missing)?,
+        numbers: numbers.ok_or_else(missing)?,
+        sampler: sampler.ok_or_else(missing)?,
+        over: over.ok_or_else(missing)?,
+        clip: clip.ok_or_else(missing)?,
+        wall: None,
+    })
+}
+
+fn gpu_ready() -> bool {
+    ENGINE.lock().map(|e| e.as_ref().is_some_and(|e| e.gpu.is_some())).unwrap_or(false)
+}
+
+/// Blue-green-red colour as the 0-to-1 values the card reads, with a strength.
+fn card_colour(bgr: u32, strength: f32) -> [f32; 4] {
+    let (r, g, b) = parts(bgr);
+    [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, strength]
+}
+
+static MOUSE_X: AtomicI32 = AtomicI32::new(0);
+static MOUSE_Y: AtomicI32 = AtomicI32::new(0);
+static LIGHT_WANTED: AtomicBool = AtomicBool::new(false);
+static LIGHT_WAITING: AtomicBool = AtomicBool::new(false);
+/// Aurora's colours are moving, which needs redrawing many times a second. Only true while a
+/// section is open or the mouse is near the glass, and the desktop is what's under the mouse.
+static DRIFTING: AtomicBool = AtomicBool::new(false);
+static CLOCK: OnceLock<Instant> = OnceLock::new();
+
+pub fn drifting() -> bool {
+    DRIFTING.load(Ordering::Relaxed)
+}
+
+/// Seconds for the shader, kept small enough for its numbers to stay accurate.
+fn clock_seconds() -> f32 {
+    CLOCK.get_or_init(Instant::now).elapsed().as_secs_f32() % 20000.0
+}
+
+/// A colour at full brightness, as neon and aurora need however pale the section's colour is.
+fn vivid(bgr: u32) -> [f32; 4] {
+    let c = card_colour(bgr, 1.0);
+    let top = c[0].max(c[1]).max(c[2]).max(0.01);
+    [c[0] / top, c[1] / top, c[2] / top, 1.0]
+}
+
+/// From the mouse hook, which must be quick. True when the worker should move the light, at most
+/// one request at a time. With Liquid off this is one relaxed read.
+pub fn note_mouse(x: i32, y: i32) -> bool {
+    if !LIGHT_WANTED.load(Ordering::Relaxed) {
+        return false;
+    }
+    MOUSE_X.store(x, Ordering::Relaxed);
+    MOUSE_Y.store(y, Ordering::Relaxed);
+    !LIGHT_WAITING.swap(true, Ordering::Relaxed)
+}
+
+/// How much the mouse leads the light, given its distance from the glass: all of it when close,
+/// none from `reach` away.
+pub fn mouse_lead(distance: f32, reach: f32) -> f32 {
+    let t = (1.0 - distance / reach).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn distance_to_box(x: f32, y: f32, left: f32, top: f32, w: f32, h: f32) -> f32 {
+    let (dx, dy) = ((left - x).max(x - left - w).max(0.0), (top - y).max(y - top - h).max(0.0));
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// Move the light to the mouse. Redraws only while the mouse is near the glass or just leaving it,
+/// so moving it elsewhere costs nothing.
+pub unsafe fn move_light(over_desktop: bool) {
+    if let Ok(mut guard) = ENGINE.lock() {
+        if let Some(e) = guard.as_mut() {
+            let (x, y) = (MOUSE_X.load(Ordering::Relaxed) as f32 - e.origin.0, MOUSE_Y.load(Ordering::Relaxed) as f32 - e.origin.1);
+            let reach = 260.0 * e.dpi;
+            let mut near = f32::MAX;
+            if e.rail_showing {
+                let r = e.rail_rect;
+                near = near.min(distance_to_box(x, y, r.0 as f32, r.1 as f32, r.2 as f32, r.3 as f32));
+            }
+            if let Some((p, _)) = e.open_panel {
+                near = near.min(distance_to_box(x, y, p.x as f32, p.y as f32, p.w as f32, p.h as f32));
+            }
+            let lead = if over_desktop { mouse_lead(near, reach) } else { 0.0 };
+            let aurora = BACKDROP.lock().is_ok_and(|b| b.as_ref().is_some_and(|b| b.liquid && b.look == 1.0));
+            let drifting = aurora && over_desktop && (lead > 0.0 || e.open_panel.is_some());
+            DRIFTING.store(drifting, Ordering::Relaxed);
+            if lead > 0.0 || e.mouse.2 > 0.0 || drifting {
+                e.mouse = (x, y, lead);
+                if e.rail_showing {
+                    e.glass_rail(false);
+                }
+                e.glass_panel(false);
+            }
+        }
+    }
+    let _ = windows_sys::Win32::Graphics::Dwm::DwmFlush(); // no faster than the screen shows
+    LIGHT_WAITING.store(false, Ordering::Relaxed);
 }
 
 impl Engine {
@@ -610,6 +848,7 @@ impl Engine {
         s.visual.SetContent(&swap).map_err(|e| e.to_string())?;
         s.swap = Some(swap);
         s.page = Some(Page::new(w, h));
+        s.words = None;
         Ok(())
     }
 
@@ -625,9 +864,239 @@ impl Engine {
         let _ = self.dcomp.Commit();
     }
 
-    unsafe fn draw_rail(&mut self) {
+    /// The wallpaper on the graphics card, with its smaller copies for blurring.
+    unsafe fn wall(&mut self) -> Option<ID3D11ShaderResourceView> {
+        let device = self.device.clone();
+        let context = self.context.clone();
+        let gpu = self.gpu.as_mut()?;
+        if gpu.wall.is_none() {
+            let guard = BACKDROP.lock().ok()?;
+            let b = guard.as_ref().filter(|b| b.liquid)?;
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: b.full_w as u32,
+                Height: b.full_h as u32,
+                MipLevels: 0, // all of them
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+                MiscFlags: D3D11_RESOURCE_MISC_GENERATE_MIPS.0 as u32,
+                ..Default::default()
+            };
+            let (mut texture, mut view) = (None, None);
+            device.CreateTexture2D(&desc, None, Some(&mut texture)).ok()?;
+            let texture = texture?;
+            device.CreateShaderResourceView(&texture, None, Some(&mut view)).ok()?;
+            let view: ID3D11ShaderResourceView = view?;
+            context.UpdateSubresource(&texture, 0, None, b._pixels.as_ptr() as *const c_void, (b.full_w * 4) as u32, 0);
+            context.GenerateMips(&view);
+            gpu.wall = Some(view);
+        }
+        gpu.wall.clone()
+    }
+
+    /// Copy a sprite's page of words to the card.
+    unsafe fn upload_words(&self, s: &mut Sprite) {
+        let Some(page) = s.page.as_ref() else { return };
+        if s.words.is_none() {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: page.w as u32,
+                Height: page.h as u32,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                ..Default::default()
+            };
+            let (mut texture, mut view) = (None, None);
+            if self.device.CreateTexture2D(&desc, None, Some(&mut texture)).is_err() {
+                return;
+            }
+            let Some(texture) = texture else { return };
+            if self.device.CreateShaderResourceView(&texture, None, Some(&mut view)).is_err() {
+                return;
+            }
+            let Some(view) = view else { return };
+            s.words = Some((texture, view));
+        }
+        if let Some((texture, _)) = &s.words {
+            self.context.UpdateSubresource(texture, 0, None, page.pixels.as_ptr() as *const c_void, (page.w * 4) as u32, 0);
+        }
+    }
+
+    /// Draw glass shapes, then the words over them, and show the result.
+    unsafe fn render(&mut self, s: &Sprite, shapes: &[(Glass, ComRect)], with_words: bool, x: f32, y: f32) {
+        let Some(wall) = self.wall() else { return };
+        let (Some(gpu), Some(swap), Some(page)) = (self.gpu.as_ref(), &s.swap, &s.page) else { return };
+        let Ok(back) = swap.GetBuffer::<ID3D11Texture2D>(0) else { return };
+        let mut target = None;
+        if self.device.CreateRenderTargetView(&back, None, Some(&mut target)).is_err() {
+            return;
+        }
+        let Some(target) = target else { return };
+        let c = &self.context;
+        c.ClearRenderTargetView(&target, &[0.0; 4]);
+        c.OMSetRenderTargets(Some(&[Some(target.clone())]), None);
+        c.RSSetViewports(Some(&[D3D11_VIEWPORT { Width: page.w as f32, Height: page.h as f32, MaxDepth: 1.0, ..Default::default() }]));
+        c.RSSetState(&gpu.clip);
+        c.OMSetBlendState(&gpu.over, Some(&[0.0; 4]), 0xFFFF_FFFF);
+        c.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        c.VSSetShader(&gpu.vertex, None);
+        c.PSSetShader(&gpu.glass, None);
+        c.PSSetSamplers(0, Some(&[Some(gpu.sampler.clone())]));
+        c.PSSetConstantBuffers(0, Some(&[Some(gpu.numbers.clone())]));
+        c.PSSetShaderResources(0, Some(&[Some(wall)]));
+        for (numbers, area) in shapes {
+            c.UpdateSubresource(&gpu.numbers, 0, None, numbers as *const Glass as *const c_void, 0, 0);
+            c.RSSetScissorRects(Some(&[*area]));
+            c.Draw(3, 0);
+        }
+        if with_words {
+            if let Some((_, view)) = &s.words {
+                c.RSSetScissorRects(Some(&[ComRect { left: 0, top: 0, right: page.w, bottom: page.h }]));
+                c.PSSetShader(&gpu.words, None);
+                c.PSSetShaderResources(0, Some(&[Some(view.clone())]));
+                c.Draw(3, 0);
+            }
+        }
+        c.OMSetRenderTargets(None, None);
+        let _ = swap.Present(0, DXGI_PRESENT(0));
+        let _ = s.visual.SetOffsetX2(x);
+        let _ = s.visual.SetOffsetY2(y);
+        let _ = self.dcomp.Commit();
+    }
+
+    fn base_numbers(&self, left: f32, top: f32) -> Glass {
+        let (w, h, look) = BACKDROP.lock().ok().and_then(|b| b.as_ref().map(|b| (b.full_w as f32, b.full_h as f32, b.look))).unwrap_or((1.0, 1.0, 0.0));
+        Glass {
+            place: [self.origin.0 + left, self.origin.1 + top, w, h],
+            mouse: [self.mouse.0 - left, self.mouse.1 - top, self.mouse.2, 0.0],
+            look: [look, clock_seconds(), 1.0, 0.0],
+            ..Default::default()
+        }
+    }
+
+    /// The labels: each a small lens with its own colour, with the words drawn once and kept, so
+    /// moving the light does not have to draw them again.
+    unsafe fn glass_rail(&mut self, repaint: bool) {
         let (x, y, w, h) = self.rail_rect;
-        let mut rail = Sprite { visual: self.rail.visual.clone(), swap: self.rail.swap.take(), page: self.rail.page.take() };
+        let dpi = self.dpi;
+        let margin = (16.0 * dpi) as i32;
+        let mut rail = Sprite { visual: self.rail.visual.clone(), swap: self.rail.swap.take(), page: self.rail.page.take(), words: self.rail.words.take() };
+        if self.ensure(&mut rail, w + 2 * margin, h + 2 * margin).is_ok() {
+            if repaint || rail.words.is_none() {
+                if let Some(page) = rail.page.as_mut() {
+                    page.clear();
+                    GdipTranslateWorldTransform(page.g, margin as f32, margin as f32, MatrixOrderPrepend);
+                    let mut c = PlusCanvas { g: page.g, dpi, alpha: 255, liquid: true };
+                    layers::paint_rail_on(&mut c, dpi, layers::pill_tint());
+                }
+                self.upload_words(&mut rail);
+            }
+            let (left, top) = ((x - margin) as f32, (y - margin) as f32);
+            let base = self.base_numbers(left, top);
+            let tint = layers::pill_tint();
+            let mut shapes = vec![];
+            if let Ok(pills) = layers::PILLS.lock() {
+                for p in pills.iter() {
+                    let r = p.rect;
+                    let colour = layers::pill_colour(p, tint);
+                    let aurora = base.look[0] == 1.0;
+                    let strength = match (p.active, p.hover) {
+                        (true, _) => if aurora { 0.35 } else { 0.62 },
+                        (_, true) => if aurora { 0.22 } else { 0.42 },
+                        _ => if aurora { 0.06 } else { 0.30 },
+                    };
+                    let numbers = Glass {
+                        box_: [(r.left + margin) as f32, (r.top + margin) as f32, (r.right - r.left) as f32, (r.bottom - r.top) as f32],
+                        shape: [14.0 * dpi, 12.0 * dpi, 2.2, dpi],
+                        tint: card_colour(colour, strength),
+                        mouse: [base.mouse[0], base.mouse[1], base.mouse[2], 0.55],
+                        look: [base.look[0], base.look[1], if p.active { 1.0 } else if p.hover { 0.8 } else { 0.5 }, 0.0],
+                        glow: vivid(p.colour),
+                        ..base
+                    };
+                    shapes.push((numbers, ComRect { left: r.left, top: r.top, right: r.right + 2 * margin, bottom: r.bottom + 2 * margin }));
+                }
+            }
+            self.render(&rail, &shapes, true, left, top);
+        }
+        self.rail = rail;
+    }
+
+    /// The open panel, with the neck melted into it and the label it pours from.
+    unsafe fn glass_panel(&mut self, repaint: bool) {
+        let Some((p, n)) = self.open_panel else { return };
+        let dpi = self.dpi;
+        let margin = (26.0 * dpi) as i32;
+        let rail = self.rail_rect;
+        let (mut left, mut top, mut right, mut bottom) = (p.x, p.y, p.x + p.w, p.y + p.h);
+        for (cx, cy) in [n.from, n.to] {
+            let half = n.end_width as i32 + 1;
+            left = left.min(cx - half);
+            top = top.min(cy - half);
+            right = right.max(cx + half);
+            bottom = bottom.max(cy + half);
+        }
+        let active = layers::PILLS.lock().ok().and_then(|pills| pills.iter().find(|q| q.active).map(|q| q.rect));
+        if let Some(r) = active {
+            left = left.min(rail.0 + r.left);
+            top = top.min(rail.1 + r.top);
+            right = right.max(rail.0 + r.right);
+            bottom = bottom.max(rail.1 + r.bottom);
+        }
+        let (left, top, right, bottom) = (left - margin, top - margin, right + margin, bottom + margin);
+        let (w, h) = (right - left, bottom - top);
+        let mut panel = Sprite { visual: self.panel.visual.clone(), swap: self.panel.swap.take(), page: self.panel.page.take(), words: self.panel.words.take() };
+        if self.ensure(&mut panel, w, h).is_ok() {
+            let settings = layers::settings_showing();
+            if settings && repaint {
+                if let Some(page) = panel.page.as_mut() {
+                    page.clear();
+                    let (fx, fy) = ((p.x - left) as f32, (p.y - top) as f32);
+                    let body = round_path(fx, fy, p.w as f32, p.h as f32, (p.radius * 2) as f32);
+                    GdipSetClipPath(page.g, body, CombineModeReplace);
+                    GdipDeletePath(body);
+                    GdipTranslateWorldTransform(page.g, fx, fy, MatrixOrderPrepend);
+                    let mut c = PlusCanvas { g: page.g, dpi, alpha: 255, liquid: true };
+                    layers::paint_settings_on(&mut c, dpi, layers::pill_tint(), layers::accent());
+                }
+                self.upload_words(&mut panel);
+            }
+            let (lf, tf) = (left as f32, top as f32);
+            let base = self.base_numbers(lf, tf);
+            let tint = blend(blend(layers::panel_tint(), layers::accent(), 0.16), 0x00FFFFFF, 0.04);
+            let band = (34.0 * dpi).min(p.h as f32 / 2.0).min(p.w as f32 / 2.0);
+            let pill = active.map(|r| [(rail.0 + r.left) as f32 - lf, (rail.1 + r.top) as f32 - tf, (r.right - r.left) as f32, (r.bottom - r.top) as f32]);
+            let (fx, fy, tx, ty) = (n.from.0 as f32 - lf, n.from.1 as f32 - tf, n.to.0 as f32 - lf, n.to.1 as f32 - tf);
+            let mid = (fx + tx) / 2.0;
+            let numbers = Glass {
+                box_: [(p.x - left) as f32, (p.y - top) as f32, p.w as f32, p.h as f32],
+                shape: [p.radius as f32, band, if settings { 3.2 } else { 0.9 }, dpi],
+                tint: card_colour(tint, if settings { if base.look[0] == 1.0 { 0.42 } else { 0.66 } } else { 0.10 }),
+                mouse: [base.mouse[0], base.mouse[1], base.mouse[2], if settings { 0.2 } else { 0.32 }],
+                neck0: [fx, fy, mid, fy],
+                neck1: [mid, ty, tx, ty],
+                neck2: [if pill.is_some() { 1.0 } else { 0.0 }, n.reach.clamp(0.02, 1.0), n.end_width / 2.0, n.mid_width / 2.0],
+                pill: pill.unwrap_or([0.0; 4]),
+                glow: vivid(layers::accent()),
+                ..base
+            };
+            self.render(&panel, &[(numbers, ComRect { left: 0, top: 0, right: w, bottom: h })], settings, lf, tf);
+        }
+        self.panel = panel;
+    }
+
+    unsafe fn draw_rail(&mut self) {
+        self.rail_showing = true;
+        if self.liquid_on() {
+            return self.glass_rail(true);
+        }
+        let (x, y, w, h) = self.rail_rect;
+        let mut rail = Sprite { visual: self.rail.visual.clone(), swap: self.rail.swap.take(), page: self.rail.page.take(), words: self.rail.words.take() };
         if self.ensure(&mut rail, w, h).is_ok() {
             if let Some(page) = rail.page.as_mut() {
                 page.clear();
@@ -643,18 +1112,7 @@ impl Engine {
                         }
                     }
                 }
-                let liquid = has_liquid();
-                if liquid {
-                    let band = 9.0 * self.dpi;
-                    if let Ok(pills) = layers::PILLS.lock() {
-                        for p in pills.iter() {
-                            let r = p.rect;
-                            let (sx, sy) = (self.origin.0 + (x + r.left) as f32, self.origin.1 + (y + r.top) as f32);
-                            bend_rim(page, r.left, r.top, r.right - r.left, r.bottom - r.top, 7.0 * self.dpi, sx as i32, sy as i32, band);
-                        }
-                    }
-                }
-                let mut c = PlusCanvas { g: page.g, dpi: self.dpi, alpha: if liquid { 112 } else if glass { 150 } else { 225 } };
+                let mut c = PlusCanvas { g: page.g, dpi: self.dpi, alpha: if glass { 150 } else { 225 }, liquid: false };
                 layers::paint_rail_on(&mut c, self.dpi, layers::pill_tint());
                 if glass {
                     if let Ok(pills) = layers::PILLS.lock() {
@@ -671,6 +1129,12 @@ impl Engine {
             self.show(&rail, x as f32, y as f32);
         }
         self.rail = rail;
+    }
+
+    fn liquid_on(&self) -> bool {
+        let on = self.gpu.is_some() && BACKDROP.lock().map(|b| b.as_ref().is_some_and(|b| b.liquid)).unwrap_or(false);
+        LIGHT_WANTED.store(on, Ordering::Relaxed);
+        on
     }
 }
 
@@ -698,6 +1162,27 @@ mod tests {
         }
         let pushed = boost_colour(0xFF80_4040, 1.45);
         assert!((pushed >> 16) & 255 > 0x80 && pushed & 255 < 0x40);
+    }
+
+    #[test]
+    fn wallpaper_goes_where_each_windows_setting_puts_it() {
+        // a square picture on a wide screen
+        let fill = wallpaper_pieces("fill", 100.0, 100.0, 200.0, 100.0);
+        assert_eq!(fill[0], ((0.0, 0.0, 200.0, 100.0), (0.0, 25.0, 100.0, 50.0)));
+        let fit = wallpaper_pieces("fit", 100.0, 100.0, 200.0, 100.0);
+        assert_eq!(fit[0].0, (50.0, 0.0, 100.0, 100.0));
+        let center = wallpaper_pieces("center", 100.0, 100.0, 200.0, 200.0);
+        assert_eq!(center[0].0, (50.0, 50.0, 100.0, 100.0));
+        assert_eq!(wallpaper_pieces("stretch", 100.0, 100.0, 200.0, 100.0)[0].0, (0.0, 0.0, 200.0, 100.0));
+        assert_eq!(wallpaper_pieces("tile", 100.0, 100.0, 250.0, 100.0).len(), 3);
+    }
+
+    #[test]
+    fn the_mouse_leads_the_light_only_when_near() {
+        assert_eq!(mouse_lead(0.0, 200.0), 1.0);
+        assert_eq!(mouse_lead(200.0, 200.0), 0.0);
+        assert_eq!(mouse_lead(900.0, 200.0), 0.0);
+        assert!(mouse_lead(50.0, 200.0) > mouse_lead(150.0, 200.0));
     }
 
     #[test]
@@ -738,8 +1223,9 @@ pub unsafe fn repaint_rail() {
 }
 
 pub unsafe fn hide_rail() {
-    if let Ok(guard) = ENGINE.lock() {
-        if let Some(e) = guard.as_ref() {
+    if let Ok(mut guard) = ENGINE.lock() {
+        if let Some(e) = guard.as_mut() {
+            e.rail_showing = false;
             let _ = e.rail.visual.SetOffsetX2(FAR_AWAY);
             let _ = e.dcomp.Commit();
         }
@@ -747,8 +1233,10 @@ pub unsafe fn hide_rail() {
 }
 
 pub unsafe fn hide_panel() {
-    if let Ok(guard) = ENGINE.lock() {
-        if let Some(e) = guard.as_ref() {
+    if let Ok(mut guard) = ENGINE.lock() {
+        if let Some(e) = guard.as_mut() {
+            e.open_panel = None;
+            e.waiting_panel = None;
             let _ = e.panel.visual.SetOffsetX2(FAR_AWAY);
             let _ = e.neck.visual.SetOffsetX2(FAR_AWAY);
             let _ = e.dcomp.Commit();
@@ -759,10 +1247,14 @@ pub unsafe fn hide_panel() {
 pub unsafe fn set_panel(x: i32, y: i32, w: i32, h: i32, radius: i32) {
     let Ok(mut guard) = ENGINE.lock() else { return };
     let Some(e) = guard.as_mut() else { return };
+    if e.liquid_on() {
+        e.waiting_panel = Some(Panel { x, y, w: w.max(2), h: h.max(2), radius }); // drawn with its neck, which comes next
+        return;
+    }
     let dpi = e.dpi;
     let shadow = (14.0 * dpi) as i32;
     let (w, h) = (w.max(2), h.max(2));
-    let mut panel = Sprite { visual: e.panel.visual.clone(), swap: e.panel.swap.take(), page: e.panel.page.take() };
+    let mut panel = Sprite { visual: e.panel.visual.clone(), swap: e.panel.swap.take(), page: e.panel.page.take(), words: e.panel.words.take() };
     if e.ensure(&mut panel, w + 2 * shadow, h + 2 * shadow).is_ok() {
         if let Some(page) = panel.page.as_mut() {
             page.clear();
@@ -784,12 +1276,9 @@ pub unsafe fn set_panel(x: i32, y: i32, w: i32, h: i32, radius: i32) {
 
             let settings = layers::settings_showing();
             let frosted = has_glass();
-            let liquid = has_liquid();
             let (shade, accent, pill) = (layers::panel_tint(), layers::accent(), layers::pill_tint());
             // real glass lets more through; text on Settings still has to stay easy to read
             let alpha = match (frosted, settings) {
-                (true, true) if liquid => 178,
-                (true, false) if liquid => 42,
                 (true, true) => 205,
                 (true, false) => 120,
                 (false, true) => 244,
@@ -800,16 +1289,10 @@ pub unsafe fn set_panel(x: i32, y: i32, w: i32, h: i32, radius: i32) {
             if frosted {
                 let (sx, sy) = ((e.origin.0 + x as f32) as i32, (e.origin.1 + y as f32) as i32);
                 fill_frosted(page, shadow, shadow, w, h, d / 2.0, sx, sy, top, bottom, alpha);
-                // liquid glass keeps bending while it moves; frosted glass waits until it rests
-                if liquid {
-                    bend_rim(page, shadow, shadow, w, h, d / 2.0, sx, sy, (30.0 * dpi).min(h as f32 / 2.0).min(w as f32 / 2.0));
-                    rim_light(g, body, fx, fy, fw, fh, dpi, 90);
-                } else {
-                    if e.panel_size == (w, h) {
-                        bend_rim(page, shadow, shadow, w, h, d / 2.0, sx, sy, 20.0 * dpi);
-                    }
-                    rim_light(g, body, fx, fy, fw, fh, 1.3 * dpi, 215);
+                if e.panel_size == (w, h) {
+                    bend_rim(page, shadow, shadow, w, h, d / 2.0, sx, sy, 20.0 * dpi);
                 }
+                rim_light(g, body, fx, fy, fw, fh, 1.3 * dpi, 215);
             } else {
                 let area = RectF { X: fx, Y: fy, Width: fw, Height: fh + 1.0 };
                 let mut glass = std::ptr::null_mut();
@@ -826,7 +1309,7 @@ pub unsafe fn set_panel(x: i32, y: i32, w: i32, h: i32, radius: i32) {
             if settings {
                 GdipSetClipPath(g, body, CombineModeReplace);
                 GdipTranslateWorldTransform(g, fx, fy, MatrixOrderPrepend);
-                let mut c = PlusCanvas { g, dpi, alpha: 255 };
+                let mut c = PlusCanvas { g, dpi, alpha: 255, liquid: false };
                 layers::paint_settings_on(&mut c, dpi, pill, accent);
             }
             GdipDeletePath(body);
@@ -840,36 +1323,35 @@ pub unsafe fn set_panel(x: i32, y: i32, w: i32, h: i32, radius: i32) {
 pub unsafe fn set_neck(from: (i32, i32), to: (i32, i32), reach: f32, end_width: f32, mid_width: f32) {
     let Ok(mut guard) = ENGINE.lock() else { return };
     let Some(e) = guard.as_mut() else { return };
+    if let Some(panel) = e.waiting_panel.take() {
+        e.open_panel = Some((panel, Neck { from, to, reach, end_width, mid_width }));
+        if BACKDROP.lock().is_ok_and(|b| b.as_ref().is_some_and(|b| b.look == 1.0)) {
+            DRIFTING.store(true, Ordering::Relaxed); // the worker's next look decides if it stays on
+        }
+        return e.glass_panel(true);
+    }
     let margin = end_width as i32 + 2;
     let (left, top) = (from.0.min(to.0) - margin, from.1.min(to.1) - margin);
     let (w, h) = ((to.0 - from.0).abs() + 2 * margin, (to.1 - from.1).abs() + 2 * margin);
     let outline = neck_outline((from.0 as f32, from.1 as f32), (to.0 as f32, to.1 as f32), reach, end_width, mid_width);
     let colour = blend(layers::pill_tint(), layers::accent(), 0.6);
-    let mut neck = Sprite { visual: e.neck.visual.clone(), swap: e.neck.swap.take(), page: e.neck.page.take() };
+    let mut neck = Sprite { visual: e.neck.visual.clone(), swap: e.neck.swap.take(), page: e.neck.page.take(), words: e.neck.words.take() };
     if e.ensure(&mut neck, w, h).is_ok() {
         if let Some(page) = neck.page.as_mut() {
             page.clear();
             let points: Vec<PointF> = outline.iter().map(|&(x, y)| PointF { X: x - left as f32, Y: y - top as f32 }).collect();
             let frosted = has_glass();
-            if has_liquid() {
-                let mut brush = std::ptr::null_mut();
-                GdipCreateSolidFill(0xFFFFFFFF, &mut brush);
-                GdipFillPolygon(page.g, brush as _, points.as_ptr(), points.len() as i32, FillModeWinding);
-                GdipDeleteBrush(brush as _);
-                bend_neck(page, &points, (e.origin.0 + left as f32) as i32, (e.origin.1 + top as f32) as i32, colour);
-            } else if frosted {
+            if frosted {
                 let mut shape = std::ptr::null_mut();
                 GdipCreatePath(FillModeWinding, &mut shape);
                 GdipAddPathPolygon(shape, points.as_ptr(), points.len() as i32);
                 paint_backdrop(page.g, shape, 0.0, 0.0, w as f32, h as f32, e.origin.0 + left as f32, e.origin.1 + top as f32);
                 GdipDeletePath(shape);
             }
-            if !has_liquid() {
-                let mut brush = std::ptr::null_mut();
-                GdipCreateSolidFill(argb(colour, if frosted { 150 } else { 235 }), &mut brush);
-                GdipFillPolygon(page.g, brush as _, points.as_ptr(), points.len() as i32, FillModeWinding);
-                GdipDeleteBrush(brush as _);
-            }
+            let mut brush = std::ptr::null_mut();
+            GdipCreateSolidFill(argb(colour, if frosted { 150 } else { 235 }), &mut brush);
+            GdipFillPolygon(page.g, brush as _, points.as_ptr(), points.len() as i32, FillModeWinding);
+            GdipDeleteBrush(brush as _);
         }
         e.show(&neck, left as f32, top as f32);
     }

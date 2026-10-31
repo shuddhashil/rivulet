@@ -31,6 +31,48 @@ pub fn picture_path() -> Option<PathBuf> {
     copy.exists().then_some(copy)
 }
 
+unsafe fn read_setting(key: &str, name: &str) -> Option<String> {
+    let mut buffer = [0u16; 64];
+    let mut size = 128u32;
+    let done = RegGetValueW(HKEY_CURRENT_USER, wide(key).as_ptr(), wide(name).as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(), buffer.as_mut_ptr() as _, &mut size);
+    if done != 0 {
+        return None;
+    }
+    let n = buffer.iter().position(|c| *c == 0).unwrap_or(0);
+    Some(String::from_utf16_lossy(&buffer[..n]))
+}
+
+pub fn placement_name(style: &str, tile: &str) -> &'static str {
+    if tile.trim() == "1" {
+        return "tile";
+    }
+    match style.trim() {
+        "0" => "center",
+        "2" => "stretch",
+        "6" => "fit",
+        _ => "fill", // Fill and Span both cover a single screen
+    }
+}
+
+/// How Windows is told to place the wallpaper: fill, fit, stretch, center or tile.
+pub fn placement_setting() -> String {
+    unsafe {
+        let style = read_setting(r"Control Panel\Desktop", "WallpaperStyle").unwrap_or_default();
+        let tile = read_setting(r"Control Panel\Desktop", "TileWallpaper").unwrap_or_default();
+        placement_name(&style, &tile).to_string()
+    }
+}
+
+/// Windows' desktop background colour, as 0xRRGGBB. Shows around a Fit or Center wallpaper.
+pub fn background_colour() -> u32 {
+    let text = unsafe { read_setting(r"Control Panel\Colors", "Background") }.unwrap_or_default();
+    let parts: Vec<u32> = text.split_whitespace().filter_map(|n| n.parse().ok()).collect();
+    match parts[..] {
+        [r, g, b] => (r.min(255) << 16) | (g.min(255) << 8) | b.min(255),
+        _ => 0,
+    }
+}
+
 /// The wallpaper's average colour as blue, green, red. GDI+ runs only for this call, so it holds
 /// no memory the rest of the time.
 pub fn average_colour() -> Option<u32> {
@@ -102,4 +144,19 @@ pub fn restore() -> Result<(), String> {
         let _ = std::fs::remove_file(crate::state_dir().join(old));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placement_follows_the_windows_settings() {
+        assert_eq!(placement_name("10", "0"), "fill");
+        assert_eq!(placement_name("6", "0"), "fit");
+        assert_eq!(placement_name("2", "0"), "stretch");
+        assert_eq!(placement_name("0", "0"), "center");
+        assert_eq!(placement_name("0", "1"), "tile");
+        assert_eq!(placement_name("22", "0"), "fill");
+    }
 }

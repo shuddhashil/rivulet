@@ -579,6 +579,7 @@ enum Command {
     ToggleRail,
     Shortcut,
     Changed,
+    Light,
     Retidy,
     Stop,
 }
@@ -680,8 +681,14 @@ impl Sections {
         let start = (lx + start_x, ly + plan.pill_mid(at));
         let end = (lx + end_x, ly + r.y + (r.h / 2).min((46.0 * m.dpi) as i32));
         // liquid pours out thick and thins as it finishes
-        let swell = if plan.cfg.style == "liquid" { 1.0 + (1.0 - reach) * 0.9 } else { 1.0 };
-        let waist = if plan.cfg.style == "liquid" { 7.0 } else { 2.5 };
+        let style = plan.cfg.style.as_str();
+        let fluid = matches!(style, "liquid" | "aurora" | "neon");
+        let swell = if fluid { 1.0 + (1.0 - reach) * 0.9 } else { 1.0 };
+        let waist = match style {
+            "liquid" | "aurora" => 16.0,
+            "neon" => 9.0, // a lit tube looks best slim
+            _ => 2.5,
+        };
         layers::set_neck(start, end, reach, m.pill_h as f32 * 0.5 * swell, waist * swell * m.dpi);
     }
 
@@ -689,8 +696,14 @@ impl Sections {
     /// Glass needs a fresh blurred wallpaper; the other styles don't keep one.
     fn apply_style(&self, style: &str) {
         unsafe {
-            if matches!(style, "glass" | "liquid") && pretty::is_on() {
-                if let Err(e) = pretty::load_backdrop(GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), style == "liquid") {
+            if matches!(style, "glass" | "liquid" | "aurora" | "neon") && pretty::is_on() {
+                let shader_look = match style {
+                    "liquid" => Some(0.0),
+                    "aurora" => Some(1.0),
+                    "neon" => Some(2.0),
+                    _ => None,
+                };
+                if let Err(e) = pretty::load_backdrop(GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), shader_look) {
                     log(&format!("glass unavailable, using the smooth look: {e}"));
                     pretty::drop_backdrop();
                 }
@@ -701,7 +714,7 @@ impl Sections {
     }
 
     fn apply_theme(&mut self, theme: &str, style: &str) {
-        let now = format!("{theme}|{style}|{}", wallpaper::current());
+        let now = format!("{theme}|{style}|{}|{}", wallpaper::current(), wallpaper::placement_setting());
         if now != self.tinted_for {
             self.apply_style(style);
             if let Some((pill, panel)) = theme_tints(theme) {
@@ -798,7 +811,7 @@ impl Sections {
         let m = plan.m;
         layers::set_accent(plan.colour(&plan.groups[at].0));
         let right = plan.cfg.right_side;
-        let liquid = plan.cfg.style == "liquid";
+        let liquid = matches!(plan.cfg.style.as_str(), "liquid" | "aurora" | "neon");
         let seed = Rect { x: full.x, y: (plan.pill_mid(at) - m.pill_h / 2).clamp(m.gap, plan.room.1 - m.pill_h), w: m.pill_h, h: m.pill_h };
         let rows = (icons.len() as i32 + across - 1) / across;
         let (open_time, close_time) = speed_times(&plan.cfg.speed);
@@ -1085,8 +1098,11 @@ fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Com
             return;
         }
         log("running");
+        let mut last_check = Instant::now();
         loop {
-            let result = match rx.recv_timeout(CHECK_EVERY) {
+            // Aurora's colours drift about 25 times a second, and only while it is worth seeing
+            let wait = if pretty::drifting() { Duration::from_millis(33) } else { CHECK_EVERY };
+            let result = match rx.recv_timeout(wait) {
                 Ok(Command::Toggle(name)) => s.toggle(name),
                 Ok(Command::Close) => s.close(),
                 Ok(Command::Hover(name)) => {
@@ -1104,14 +1120,30 @@ fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Com
                     s.settle()
                 }
                 Ok(Command::Retidy) => s.settle(),
+                Ok(Command::Light) => {
+                    let mut pt = POINT { x: 0, y: 0 };
+                    GetCursorPos(&mut pt);
+                    pretty::move_light(over_desktop(pt));
+                    Ok(())
+                }
                 Ok(Command::Stop) | Err(RecvTimeoutError::Disconnected) => {
                     s.lay_all_out();
                     PostMessageW(window as HWND, WM_CLOSE, 0, 0);
                     return;
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    if s.needs_settle() {
-                        s.settle()
+                    if pretty::drifting() {
+                        let mut pt = POINT { x: 0, y: 0 };
+                        GetCursorPos(&mut pt);
+                        pretty::move_light(over_desktop(pt));
+                    }
+                    if last_check.elapsed() >= CHECK_EVERY {
+                        last_check = Instant::now();
+                        if s.needs_settle() {
+                            s.settle()
+                        } else {
+                            Ok(())
+                        }
                     } else {
                         Ok(())
                     }
@@ -1217,7 +1249,12 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     if code >= 0 {
         let pt = (*(lparam as *const MSLLHOOKSTRUCT)).pt;
         match wparam as u32 {
-            WM_MOUSEMOVE => mouse_moved(pt),
+            WM_MOUSEMOVE => {
+                mouse_moved(pt);
+                if pretty::note_mouse(pt.x, pt.y) {
+                    send(Command::Light);
+                }
+            }
             WM_LBUTTONDOWN => {
                 if left_down(pt) {
                     SWALLOW_RELEASE.store(true, Ordering::Relaxed);

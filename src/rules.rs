@@ -22,7 +22,7 @@ pub struct Config {
     pub dots: bool,
     pub click_away: bool,
     pub double_click_hide: bool,
-    /// plain, smooth, glass or liquid. Anything but plain needs the graphics libraries.
+    /// plain, smooth, glass, liquid, aurora or neon. Anything but plain needs the graphics libraries.
     pub style: String,
 }
 
@@ -161,8 +161,8 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
                 "double_click_hide" => cfg.double_click_hide = on_off(&key, value)?,
                 "pretty" => old_pretty = on_off(&key, value)?, // from before there were styles
                 "style" => {
-                    if !matches!(value, "plain" | "smooth" | "glass" | "liquid") {
-                        return Err(format!("sections.ini: style should be plain, smooth, glass or liquid: {line}"));
+                    if !matches!(value, "plain" | "smooth" | "glass" | "liquid" | "aurora" | "neon") {
+                        return Err(format!("sections.ini: style should be plain, smooth, glass, liquid, aurora or neon: {line}"));
                     }
                     cfg.style = value.to_string();
                     style_given = true;
@@ -428,6 +428,8 @@ mod tests {
         assert_eq!(with("pretty = on\nstyle = glass"), "glass"); // a chosen style wins, either order
         assert_eq!(with("style = plain\npretty = on"), "plain");
         assert_eq!(with("style = liquid"), "liquid");
+        assert_eq!(with("style = aurora"), "aurora");
+        assert_eq!(with("style = neon"), "neon");
     }
 
     #[test]

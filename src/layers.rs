@@ -56,6 +56,10 @@ pub enum Style {
 
 /// What the rail and Settings need from a drawing surface.
 pub trait Canvas {
+    /// A label's background, which Liquid draws on the graphics card instead.
+    fn pill(&mut self, r: RECT, radius: i32, colour: u32) {
+        self.fill(r, radius, colour);
+    }
     fn fill(&mut self, r: RECT, radius: i32, colour: u32);
     fn text(&mut self, r: RECT, s: &str, colour: u32, style: Style, flags: u32);
 }
@@ -209,13 +213,22 @@ unsafe fn font(name: &str, size: f32, weight: i32) -> HFONT {
     CreateFontW(-size as i32, 0, 0, 0, weight, 0, 0, 0, 0, 0, 0, CLEARTYPE_QUALITY as u32, 0, wide(name).as_ptr())
 }
 
+pub fn pill_colour(p: &Pill, base: u32) -> u32 {
+    if p.active {
+        blend(base, p.colour, 0.55)
+    } else if p.hover {
+        blend(base, p.colour, 0.28)
+    } else {
+        base
+    }
+}
+
 pub fn paint_rail_on(c: &mut dyn Canvas, dpi: f32, base: u32) {
     let scaled = |v: f32| (v * dpi) as i32;
     if let Ok(pills) = PILLS.lock() {
         for p in pills.iter() {
             let r = p.rect;
-            let background = if p.active { blend(base, p.colour, 0.55) } else if p.hover { blend(base, p.colour, 0.28) } else { base };
-            c.fill(r, scaled(14.0), background);
+            c.pill(r, scaled(14.0), pill_colour(p, base));
             let icon = RECT { left: r.left + scaled(10.0), top: r.top, right: r.left + scaled(32.0), bottom: r.bottom };
             c.text(icon, &p.glyph.to_string(), if p.active { WHITE } else { p.colour }, Style::Glyph, DT_LEFT);
             let mut area = RECT { left: r.left + scaled(34.0), top: r.top, right: r.right - scaled(10.0), bottom: r.bottom };

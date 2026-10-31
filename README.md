@@ -10,7 +10,7 @@ Rivulet sorts your desktop icons by type into a slim rail of labels on the left.
 
 ## Why
 
-- **Tiny.** A single exe of about 536 KB, written in Rust.
+- **Tiny.** A single exe of about 564 KB, written in Rust.
 - **Light.** Measured at 2-3 MB of its own memory while idle (10-17 MB counting Windows libraries shared with other programs), and almost no CPU.
 - **Safe for your files.** Nothing is moved, renamed or hidden on disk. Only icon positions change, so every path keeps working.
 - **Leaves your wallpaper alone.** It draws in its own see-through layer behind the icons.
@@ -24,7 +24,7 @@ Rivulet sorts your desktop icons by type into a slim rail of labels on the left.
 - **Ctrl+Alt+D** shows the desktop with your last section open. Press again to go back.
 - **A Settings label** for themes, labels on the left or right, animation speed, and more.
 - **Double-click empty desktop** to hide the labels for a completely clean screen, and again to bring them back.
-- **Four styles.** Plain is the default and uses 2-3 MB. Smooth adds soft corners and shadows (60-90 MB). Glass is frosted glass made from your own wallpaper (55-100 MB). Liquid is nearly clear glass: the picture bends through the rim with a touch of colour fringing, light follows the curve, and panels wobble as they open (60-120 MB). The last three need the graphics card; with Plain, those libraries are never loaded.
+- **Six styles.** Plain is the default and uses 2-3 MB. Smooth adds soft corners and shadows (60-90 MB). Glass is frosted glass made from your own wallpaper (55-100 MB). Liquid is clear glass drawn by a shader on the graphics card: the wallpaper bends through the rim with a touch of colour fringing, the panel, neck and label melt into one shape, the light follows your mouse, and the glass deepens over bright wallpaper so text stays readable (80-130 MB). Aurora fills the glass with slow curtains of colour from your wallpaper and sections, moving only while a section is open or the mouse is near. Neon is dark glass with a lit tube round each edge in the section's colour, spilling light that brightens as the mouse comes close. All but Plain need the graphics card; with Plain, those libraries are never loaded.
 - Colours per section, five themes, and tints that follow your wallpaper.
 - New files are sorted as they arrive, and it recovers by itself if Explorer restarts.
 
@@ -94,7 +94,7 @@ This is an early release, so please read this.
 - **Older Windows versions are untested.** There is a fallback for the older desktop layout, but it has never been run on a real machine. It needs Windows 10 version 1703 or later.
 - **A second screen is untested.** Choosing a screen in the rules is written and unit tested, but has not been tried on real hardware.
 - In the Plain style, rounded corners are slightly rough, because Windows does not allow fine per-pixel transparency in this layer without a much heavier drawing method.
-- Glass and Liquid assume the wallpaper uses Windows' Fill setting. With another setting, or across a second screen, the picture in the glass may not line up with the real one.
+- Glass and Liquid follow Windows' Fill, Fit, Stretch, Center and Tile settings on the main screen. With a different wallpaper on a second screen, or Span across screens, the picture in the glass may not line up with the real one.
 - Hidden icons can flash for a moment on Refresh.
 - It relies on undocumented Windows behaviour, so a Windows update could break it.
 - One section opens at a time, and a section cannot hold more icons than fit on the screen.
