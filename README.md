@@ -19,6 +19,7 @@ Rivulet sorts your desktop icons by type into a slim rail of labels on the left.
 
 - Sections by file type: Folders, Word, Excel, PowerPoint, PDF, Notes, Code, Apps, Zips.
 - **Recent** shows what you created or changed in the last 3 days, wherever it belongs.
+- **Folder portals** add a label for any folder, such as Downloads or a cloud folder, showing its newest files without moving anything. Double-click a file to open it.
 - **A dot** on a label means something new arrived that you have not looked at.
 - **Drag an icon onto a label** to file it there for good.
 - **Ctrl+Alt+D** shows the desktop with your last section open. Press again to go back.
@@ -78,6 +79,14 @@ column5 = Thesis
 Thesis = 38C6D9
 ```
 
+To add a folder as a section of its own:
+
+```ini
+[portals]
+Downloads = %USERPROFILE%\Downloads
+Thesis drive = D:\Thesis
+```
+
 The same file also sets the shortcut and the screen. It explains each setting.
 
 ## Stopping and removing it
@@ -97,6 +106,7 @@ This is an early release, so please read this.
 - Glass and Liquid follow Windows' Fill, Fit, Stretch, Center and Tile settings on the main screen. With a different wallpaper on a second screen, or Span across screens, the picture in the glass may not line up with the real one.
 - Hidden icons can flash for a moment on Refresh.
 - It relies on undocumented Windows behaviour, so a Windows update could break it.
+- Portals show a folder's newest 24 files and open them on a double-click. They have no right-click menu or drag and drop yet, and they refresh when opened.
 - One section opens at a time, and a section cannot hold more icons than fit on the screen.
 
 If something breaks, run `rivulet.exe --doctor` and [open an issue](../../issues/new/choose) with the report. It contains no file names.

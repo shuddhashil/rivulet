@@ -2,6 +2,7 @@
 //! both read this one list, so they can't disagree, and `cargo test` can check it.
 
 use crate::rules::Config;
+use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::RECT;
 
 pub const SETTINGS: &str = "Settings";
@@ -23,6 +24,10 @@ pub enum Action {
     Resort,
     Undo,
     Stop,
+    /// A file in a portal: opens on a double-click, like a desktop icon.
+    Open(PathBuf),
+    /// The portal's own button: opens at once.
+    OpenFolder(PathBuf),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -34,6 +39,8 @@ pub enum Look {
     Switch(bool),
     Value(String),
     Button(String),
+    /// A file in a portal: its name and its icon handle.
+    File(String, isize),
 }
 
 #[derive(Clone)]
@@ -142,6 +149,37 @@ pub fn build(cfg: &Config, login: bool, dpi: f32) -> Vec<Item> {
     b.items
 }
 
+/// A portal shows its newest files only, so it stays quick and always fits on the screen.
+pub const PORTAL_SHOWN: usize = 24;
+
+pub fn portal_header(dpi: f32) -> i32 {
+    (ROW * dpi) as i32
+}
+
+/// A portal's panel, as plain data like Settings. `files` holds (path, name, icon), and `total` is
+/// how many the folder really has. `cell` and `pad` match the desktop's own icon grid.
+pub fn build_portal(name: &str, folder: &Path, files: &[(PathBuf, String, isize)], total: usize, across: i32, cell: (i32, i32), pad: i32, dpi: f32) -> Vec<Item> {
+    let px = |v: f32| (v * dpi) as i32;
+    let width = across * cell.0 + 2 * pad;
+    let header = portal_header(dpi);
+    let button_w = px(100.0);
+    let button = RECT { left: width - pad - button_w - px(6.0), top: px(6.0), right: width - pad - px(6.0), bottom: header - px(2.0) };
+    let title = if total > files.len() { format!("{name}: newest {} of {total}", files.len()) } else { name.to_string() };
+    let mut items = vec![
+        Item { rect: RECT { left: pad + px(8.0), top: px(6.0), right: button.left - px(6.0), bottom: header - px(2.0) }, look: Look::Heading(title), action: None },
+        Item { rect: button, look: Look::Button("Open folder".to_string()), action: Some(Action::OpenFolder(folder.to_path_buf())) },
+    ];
+    if files.is_empty() {
+        items.push(Item { rect: RECT { left: pad + px(8.0), top: header + pad, right: width - pad, bottom: header + pad + cell.1 }, look: Look::Note("This folder is empty.".to_string()), action: None });
+    }
+    for (n, (path, file, icon)) in files.iter().enumerate() {
+        let (col, row) = (n as i32 % across, n as i32 / across);
+        let (left, top) = (pad + col * cell.0, header + pad + row * cell.1);
+        items.push(Item { rect: RECT { left, top, right: left + cell.0, bottom: top + cell.1 }, look: Look::File(file.clone(), *icon), action: Some(Action::Open(path.clone())) });
+    }
+    items
+}
+
 /// What a click at this spot inside the panel does.
 pub fn action_at(items: &[Item], x: i32, y: i32) -> Option<Action> {
     items.iter().find(|i| x >= i.rect.left && x < i.rect.right && y >= i.rect.top && y < i.rect.bottom).and_then(|i| i.action.clone())
@@ -215,6 +253,28 @@ mod tests {
         let items = build(&cfg, false, 1.0);
         assert!(items.iter().any(|i| i.action == Some(Action::Set("recent", "days", "0".to_string())))); // can't go below
         assert!(items.iter().any(|i| i.action == Some(Action::Set("recent", "days", "1".to_string()))));
+    }
+
+    #[test]
+    fn portal_cells_fit_and_each_opens_its_own_file() {
+        let files: Vec<_> = (0..7).map(|n| (PathBuf::from(format!("C:\\d\\{n}.txt")), format!("{n}.txt"), 0)).collect();
+        let items = build_portal("Downloads", Path::new("C:\\d"), &files, 7, 3, (100, 90), 8, 1.25);
+        let (w, h) = (3 * 100 + 16, portal_header(1.25) + 3 * 90 + 16);
+        for a in &items {
+            assert!(a.rect.left >= 0 && a.rect.right <= w && a.rect.top >= 0 && a.rect.bottom <= h, "{:?}", a.look);
+        }
+        let last = items.last().unwrap();
+        assert_eq!(action_at(&items, last.rect.left + 1, last.rect.top + 1), Some(Action::Open(PathBuf::from("C:\\d\\6.txt"))));
+        assert!(items.iter().any(|i| i.action == Some(Action::OpenFolder(PathBuf::from("C:\\d")))));
+    }
+
+    #[test]
+    fn a_portal_says_when_it_is_empty_or_cut_short() {
+        let empty = build_portal("D", Path::new("C:\\d"), &[], 0, 3, (100, 90), 8, 1.0);
+        assert!(empty.iter().any(|i| i.look == Look::Note("This folder is empty.".to_string())));
+        let one = [(PathBuf::from("C:\\d\\a"), "a".to_string(), 0)];
+        let cut = build_portal("D", Path::new("C:\\d"), &one, 50, 3, (100, 90), 8, 1.0);
+        assert_eq!(cut[0].look, Look::Heading("D: newest 1 of 50".to_string()));
     }
 
     #[test]

@@ -62,6 +62,7 @@ pub trait Canvas {
     }
     fn fill(&mut self, r: RECT, radius: i32, colour: u32);
     fn text(&mut self, r: RECT, s: &str, colour: u32, style: Style, flags: u32);
+    fn icon(&mut self, x: i32, y: i32, size: i32, icon: isize);
 }
 
 struct GdiCanvas {
@@ -116,6 +117,12 @@ impl Canvas for GdiCanvas {
             let w: Vec<u16> = s.encode_utf16().collect();
             let mut area = r;
             DrawTextW(self.dc, w.as_ptr() as _, w.len() as i32, &mut area, flags | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+    }
+
+    fn icon(&mut self, x: i32, y: i32, size: i32, icon: isize) {
+        unsafe {
+            DrawIconEx(self.dc, x, y, icon as HICON, size, size, 0, null_mut(), DI_NORMAL);
         }
     }
 }
@@ -257,6 +264,14 @@ pub fn paint_settings_on(c: &mut dyn Canvas, dpi: f32, base: u32, accent: u32) {
                 Look::Text(t) => c.text(RECT { right: r.right + (200.0 * dpi) as i32, ..r }, t, 0x00E8E4E0, Style::Label, DT_LEFT),
                 Look::Note(t) => c.text(r, t, SOFT, Style::Small, DT_LEFT),
                 Look::Value(t) => c.text(r, t, WHITE, Style::Label, DT_CENTER),
+                Look::File(name, icon) => {
+                    let size = (32.0 * dpi) as i32;
+                    let top = r.top + (6.0 * dpi) as i32;
+                    c.icon((r.left + r.right - size) / 2, top, size, *icon);
+                    let inset = (5.0 * dpi) as i32;
+                    let words = RECT { left: r.left + inset, top: top + size + inset / 2, right: r.right - inset, bottom: top + size + (24.0 * dpi) as i32 };
+                    c.text(words, name, WHITE, Style::Small, DT_CENTER | DT_END_ELLIPSIS);
+                }
                 Look::Button(t) => {
                     c.fill(r, radius, idle);
                     c.text(r, t, WHITE, Style::Label, DT_CENTER);

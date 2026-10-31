@@ -40,7 +40,8 @@ use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows_sys::Win32::UI::HiDpi::*;
-use windows_sys::Win32::UI::Shell::SHGetFolderPathW;
+use windows_sys::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
+use windows_sys::Win32::UI::Shell::{SHGetFileInfoW, SHGetFolderPathW, ShellExecuteW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const LVM_GETITEMCOUNT: u32 = 0x1004;
@@ -363,6 +364,44 @@ struct Plan {
     room: (i32, i32),
     tightened: bool,
     unclear: Vec<String>,
+    /// The sections that show a folder rather than desktop icons.
+    portals: HashMap<String, Portal>,
+}
+
+struct Portal {
+    folder: PathBuf,
+    /// Newest first, and no more than fit.
+    files: Vec<(PathBuf, String)>,
+    /// How many the folder really has.
+    total: usize,
+}
+
+/// A folder's visible files, newest first. A folder on a sleeping network drive could hold up this
+/// read, which runs on the worker. ponytail: read it on its own thread if anyone hits that.
+fn read_portal(folder: PathBuf) -> Option<Portal> {
+    use std::os::windows::fs::MetadataExt;
+    const HIDDEN_OR_SYSTEM: u32 = 2 | 4;
+    let mut found = vec![];
+    for entry in std::fs::read_dir(&folder).ok()?.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.file_attributes() & HIDDEN_OR_SYSTEM != 0 {
+            continue;
+        }
+        let secs = |t: std::io::Result<std::time::SystemTime>| t.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+        found.push((secs(meta.modified()).max(secs(meta.created())), entry.path(), entry.file_name().to_string_lossy().into_owned()));
+    }
+    let total = found.len();
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.cmp(&b.2)));
+    found.truncate(settings::PORTAL_SHOWN);
+    Some(Portal { folder, files: found.into_iter().map(|(_, path, name)| (path, name)).collect(), total })
+}
+
+/// The icon Windows shows for this file. ponytail: kept for the program's life, as there are few;
+/// free the oldest if a busy folder ever makes this matter.
+unsafe fn file_icon(path: &Path) -> isize {
+    let mut info: SHFILEINFOW = std::mem::zeroed();
+    SHGetFileInfoW(wide(&path.to_string_lossy()).as_ptr(), 0, &mut info, std::mem::size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | SHGFI_LARGEICON);
+    info.hIcon as isize
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -387,6 +426,7 @@ fn glyph(section: &str) -> char {
         "Zips" => '\u{E7B8}',
         "Other" => '\u{E712}',
         SETTINGS => '\u{E713}',
+        "Downloads" => '\u{E896}',
         _ => '\u{E8A5}',
     }
 }
@@ -435,6 +475,11 @@ impl Plan {
         let (across, w, h) = if self.groups[at].0 == SETTINGS {
             let (w, h) = settings::size(m.dpi);
             (1, w, h)
+        } else if let Some(portal) = self.portals.get(&self.groups[at].0) {
+            let header = settings::portal_header(m.dpi);
+            let (across, rows) = panel_grid((portal.files.len() as i32).max(1), m.cell_w, m.cell_h, room_w, room_h - header)?;
+            let across = across.max(3); // room for the title and the button
+            (across, across * m.cell_w + 2 * m.pad, header + rows * m.cell_h + 2 * m.pad)
         } else {
             let (across, rows) = panel_grid(self.groups[at].1.len() as i32, m.cell_w, m.cell_h, room_w, room_h)?;
             (across, across * m.cell_w + 2 * m.pad, rows * m.cell_h + 2 * m.pad)
@@ -511,6 +556,14 @@ unsafe fn make_plan(desk: &Desktop, cfg: &Config) -> Result<Plan, String> {
             groups.push((section.clone(), items.into_iter().map(|x| x.2).collect::<Vec<_>>()));
         }
     }
+    let mut portals = HashMap::new();
+    for (name, folder) in &cfg.portals {
+        // a folder that is missing, such as an unplugged drive, just shows no label for now
+        if let Some(portal) = read_portal(PathBuf::from(expand_variables(folder, |n| std::env::var(n).ok()))) {
+            groups.push((name.clone(), vec![]));
+            portals.insert(name.clone(), portal);
+        }
+    }
     groups.push((SETTINGS.to_string(), vec![]));
 
     let dpi = GetDpiForWindow(desk.lv) as f32 / 96.0;
@@ -547,10 +600,11 @@ unsafe fn make_plan(desk: &Desktop, cfg: &Config) -> Result<Plan, String> {
             room,
             tightened: tighten < 1.0,
             unclear: vec![],
+            portals: HashMap::new(),
         };
         let (room_w, room_h) = plan.panel_room();
         if groups.iter().all(|(_, g)| panel_grid(g.len() as i32, m.cell_w, m.cell_h, room_w, room_h).is_some()) {
-            return Ok(Plan { labels, groups, unclear, ..plan });
+            return Ok(Plan { labels, groups, unclear, portals, ..plan });
         }
     }
     Err(format!("{} icons do not fit on the screen, even with the tightest spacing.", labels.len()))
@@ -604,6 +658,8 @@ struct Sections {
     login: bool,
     tinted_for: String,
     main_window: usize,
+    icons: HashMap<PathBuf, isize>,
+    last_file_click: Option<(Instant, PathBuf)>,
 }
 
 unsafe fn load_plan(desk: &Desktop) -> Result<Plan, String> {
@@ -655,7 +711,7 @@ impl Sections {
             let fresh = plan.cfg.dots && self.seen.as_ref().is_some_and(|seen| icons.iter().any(|&i| !seen.contains(&plan.labels[i].to_lowercase())));
             pills.push(layers::Pill {
                 name: name.clone(),
-                count: icons.len(),
+                count: plan.portals.get(name).map_or(icons.len(), |p| p.total),
                 active: self.open.as_deref() == Some(name.as_str()),
                 hover: self.hover.as_deref() == Some(name.as_str()),
                 fresh,
@@ -727,10 +783,26 @@ impl Sections {
     }
 
     /// Fill the panel with controls if Settings is the open section, or clear them if not.
-    unsafe fn sync_settings(&self, plan: &Plan) {
-        let showing = self.open.as_deref() == Some(SETTINGS);
-        SETTINGS_OPEN.store(showing, Ordering::Relaxed);
-        layers::set_settings(if showing { settings::build(&plan.cfg, self.login, plan.m.dpi) } else { vec![] });
+    unsafe fn sync_settings(&mut self, plan: &Plan) {
+        let items = match self.open.as_deref() {
+            Some(SETTINGS) => settings::build(&plan.cfg, self.login, plan.m.dpi),
+            Some(name) => match (plan.portals.get(name), plan.index(name).and_then(|at| plan.panel(at))) {
+                (Some(portal), Some((_, across))) => {
+                    let m = plan.m;
+                    let files: Vec<_> = portal
+                        .files
+                        .iter()
+                        .map(|(path, file)| (path.clone(), file.clone(), *self.icons.entry(path.clone()).or_insert_with(|| file_icon(path))))
+                        .collect();
+                    settings::build_portal(name, &portal.folder, &files, portal.total, across, (m.cell_w, m.cell_h), m.pad, m.dpi)
+                }
+                _ => vec![],
+            },
+            None => vec![],
+        };
+        // a panel of Rivulet's own controls, so clicks in it come here and not to the desktop
+        SETTINGS_OPEN.store(!items.is_empty(), Ordering::Relaxed);
+        layers::set_settings(items);
     }
 
     /// Put everything exactly where it belongs, with no animation.
@@ -945,6 +1017,9 @@ impl Sections {
     }
 
     unsafe fn toggle(&mut self, name: String) -> Result<(), String> {
+        if self.last_plan.as_ref().is_some_and(|p| p.portals.contains_key(&name)) {
+            self.last_plan = None; // a folder may have changed since it was last read
+        }
         let plan = self.current_plan()?;
         let previous = self.open.clone();
         self.close_open(&plan, previous.as_deref() == Some(name.as_str()));
@@ -987,8 +1062,9 @@ impl Sections {
 
     /// An icon was dragged onto a label: pin the selected icons to that section.
     unsafe fn file_selected(&mut self, section: String) -> Result<(), String> {
-        if section == RECENT || section == SETTINGS {
-            return self.settle(); // Recent is worked out, not filed into
+        let portal = self.last_plan.as_ref().is_some_and(|p| p.portals.contains_key(&section));
+        if section == RECENT || section == SETTINGS || portal {
+            return self.settle(); // these are worked out, not filed into
         }
         let mut text = std::fs::read_to_string(rules_file()).map_err(|e| e.to_string())?;
         for i in self.desk.selected() {
@@ -1034,6 +1110,19 @@ impl Sections {
                 send(Command::Stop);
                 Ok(())
             }
+            Some(Action::Open(path)) => {
+                let limit = Duration::from_millis(GetDoubleClickTime() as u64);
+                if self.last_file_click.take().is_some_and(|(t, p)| t.elapsed() <= limit && p == path) {
+                    open_path(&path);
+                } else {
+                    self.last_file_click = Some((Instant::now(), path));
+                }
+                Ok(())
+            }
+            Some(Action::OpenFolder(path)) => {
+                open_path(&path);
+                Ok(())
+            }
             None => Ok(()),
         }
     }
@@ -1070,6 +1159,11 @@ impl Sections {
     }
 }
 
+/// Open a file or folder the way double-clicking it would.
+unsafe fn open_path(path: &Path) {
+    ShellExecuteW(std::ptr::null_mut(), wide("open").as_ptr(), wide(&path.to_string_lossy()).as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL);
+}
+
 /// Windows' own icon width, kept so it can be put back.
 unsafe fn remember_spacing(desk: &Desktop) {
     if !spacing_file().exists() {
@@ -1090,7 +1184,8 @@ unsafe fn restore_spacing(desk: &Desktop) {
 fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Command>, window: usize) {
     unsafe {
         let last_section = open.clone();
-        let mut s = Sections { desk, open, hover: None, hidden: vec![], count: 0, seen: None, last_plan: None, last_section, shortcut_showing: false, rail_hidden: false, login: login_is_on(), tinted_for: String::from("\0"), main_window: window };
+        let mut s = Sections { desk, open, hover: None, hidden: vec![], count: 0, seen: None, last_plan: None, last_section, shortcut_showing: false, rail_hidden: false, login: login_is_on(), tinted_for: String::from("\0"), main_window: window, icons: HashMap::new(), last_file_click: None };
+        CoInitializeEx(std::ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32); // file icons and opening files ask for it
         if let Err(e) = s.settle() {
             log(&format!("first sort failed: {e}"));
             alert(&e);

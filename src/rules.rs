@@ -24,6 +24,30 @@ pub struct Config {
     pub double_click_hide: bool,
     /// plain, smooth, glass, liquid, aurora or neon. Anything but plain needs the graphics libraries.
     pub style: String,
+    /// Sections that show a folder: (label, folder, which may name %VARIABLES%).
+    pub portals: Vec<(String, String)>,
+}
+
+/// A path with each %NAME% replaced by that variable's value. Unknown names stay as written.
+pub fn expand_variables(text: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    let parts: Vec<&str> = text.split('%').collect();
+    let mut out = parts[0].to_string();
+    let mut n = 1;
+    while n < parts.len() {
+        match (n + 1 < parts.len()).then(|| lookup(parts[n])).flatten() {
+            Some(value) => {
+                out += &value;
+                out += parts[n + 1];
+                n += 2;
+            }
+            None => {
+                out.push('%');
+                out += parts[n];
+                n += 1;
+            }
+        }
+    }
+    out
 }
 
 fn on_off(key: &str, value: &str) -> Result<bool, String> {
@@ -98,6 +122,7 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
         click_away: true,
         double_click_hide: true,
         style: "plain".to_string(),
+        portals: vec![],
     };
     let mut old_pretty = false;
     let mut style_given = false;
@@ -118,6 +143,7 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
         match part.as_str() {
             "types" => cfg.types.push((key, value.to_lowercase().split_whitespace().map(String::from).collect())),
             "names" => cfg.names.push((key, value.to_string())),
+            "portals" => cfg.portals.push((key, value.to_string())),
             "layout" => cfg.order.extend(value.split(',').map(|s| s.trim().to_string())),
             "colours" => {
                 let rgb = u32::from_str_radix(value, 16).map_err(|_| format!("sections.ini: not a colour: {line}"))?;
@@ -182,6 +208,9 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
     }
     if let Some((bad, _)) = cfg.types.iter().find(|(t, _)| !cfg.order.contains(t)) {
         return Err(format!("sections.ini section missing from [layout]: {bad}"));
+    }
+    if let Some((bad, _)) = cfg.portals.iter().find(|(p, _)| p == RECENT || p == "Settings" || known(p)) {
+        return Err(format!("sections.ini: a portal needs its own name, and this one is taken: {bad}"));
     }
     if !cfg.types.iter().any(|(t, _)| t == "Other") {
         return Err("sections.ini needs an Other section.".into());
@@ -418,6 +447,25 @@ mod tests {
         let elsewhere = set_setting("[a]\nk = 1\n[b]\nk = 2\n", "b", "k", "3");
         assert_eq!(elsewhere, "[a]\nk = 1\n[b]\nk = 3\n");
         assert!(set_setting("[a]\n", "b", "k", "3").ends_with("[b]\nk = 3\n"));
+    }
+
+    #[test]
+    fn portals_load_and_cannot_take_a_used_name() {
+        let base = "[types]\nOther =\n[layout]\ncolumn1 = Other\n[portals]\n";
+        let cfg = parse_config(&format!("{base}Downloads = %USERPROFILE%\\Downloads\n")).unwrap();
+        assert_eq!(cfg.portals, vec![("Downloads".to_string(), "%USERPROFILE%\\Downloads".to_string())]);
+        for taken in ["Other", "Recent", "Settings"] {
+            assert!(parse_config(&format!("{base}{taken} = C:\\x\n")).is_err(), "{taken}");
+        }
+    }
+
+    #[test]
+    fn variables_expand_and_odd_percents_survive() {
+        let look = |n: &str| (n == "HOME").then(|| "C:\\me".to_string());
+        assert_eq!(expand_variables("%HOME%\\Downloads", look), "C:\\me\\Downloads");
+        assert_eq!(expand_variables("D:\\plain", look), "D:\\plain");
+        assert_eq!(expand_variables("D:\\100%\\x", look), "D:\\100%\\x");
+        assert_eq!(expand_variables("%NOPE%\\x", look), "%NOPE%\\x");
     }
 
     #[test]

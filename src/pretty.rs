@@ -479,6 +479,34 @@ impl Canvas for PlusCanvas {
             GdipDeleteFontFamily(family);
         }
     }
+
+    fn icon(&mut self, x: i32, y: i32, size: i32, icon: isize) {
+        unsafe {
+            // GDI+ loses an icon's transparency when given it directly, so draw it into memory first
+            use windows_sys::Win32::Graphics::Gdi::*;
+            let mut info: BITMAPINFO = std::mem::zeroed();
+            info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            info.bmiHeader.biWidth = size;
+            info.bmiHeader.biHeight = -size;
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            let dc = CreateCompatibleDC(std::ptr::null_mut());
+            let mut bits = std::ptr::null_mut();
+            let dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+            if !dib.is_null() {
+                let old = SelectObject(dc, dib as _);
+                windows_sys::Win32::UI::WindowsAndMessaging::DrawIconEx(dc, 0, 0, icon as _, size, size, 0, std::ptr::null_mut(), windows_sys::Win32::UI::WindowsAndMessaging::DI_NORMAL);
+                let mut picture = std::ptr::null_mut();
+                if GdipCreateBitmapFromScan0(size, size, size * 4, PARGB, bits as *mut u8, &mut picture) == 0 {
+                    GdipDrawImageRectI(self.g, picture as _, x, y, size, size);
+                    GdipDisposeImage(picture as _);
+                }
+                SelectObject(dc, old);
+                DeleteObject(dib as _);
+            }
+            DeleteDC(dc);
+        }
+    }
 }
 
 /// One thing on screen: a picture the compositor can move around for free.
