@@ -15,12 +15,14 @@
 
 mod layers;
 mod pretty;
+mod ghost;
 mod rules;
 mod settings;
+mod shellmenu;
 mod wallpaper;
 
 use rules::*;
-use settings::{Action, SETTINGS};
+use settings::{Action, Arrow, Look, SETTINGS};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::os::windows::process::CommandExt;
@@ -48,6 +50,7 @@ const LVM_GETITEMCOUNT: u32 = 0x1004;
 const LVM_GETNEXTITEM: u32 = 0x100C;
 const LVM_SETITEMPOSITION: u32 = 0x100F;
 const LVM_GETITEMPOSITION: u32 = 0x1010;
+const LVM_HITTEST: u32 = 0x1012;
 const LVM_GETITEMSPACING: u32 = 0x1033;
 const LVM_SETICONSPACING: u32 = 0x1035;
 const LVM_GETITEMTEXTW: u32 = 0x1073;
@@ -60,6 +63,8 @@ const WM_RETIDY: u32 = WM_APP + 1;
 const WM_STOP: u32 = WM_APP + 2;
 const WM_REMAKE: u32 = WM_APP + 3;
 const WM_MENU: u32 = WM_APP + 4;
+const WM_TAKE_KEYS: u32 = WM_APP + 5;
+const WM_GIVE_BACK_KEYS: u32 = WM_APP + 6;
 const SPI_SETWORKAREA_CHANGE: usize = 47;
 const EVENT_OBJECT_CREATE: u32 = 0x8000;
 const EVENT_OBJECT_DESTROY: u32 = 0x8001;
@@ -190,6 +195,21 @@ impl Desktop {
         String::from_utf16_lossy(&buf)
     }
 
+    /// The icon under this screen point, if any. Asked by the worker, never by the mouse hook.
+    unsafe fn icon_under(&self, mut pt: POINT) -> Option<usize> {
+        ScreenToClient(self.lv, &mut pt);
+        let mut info = [0i32; 6]; // LVHITTESTINFO: x, y, flags, item, subitem, group
+        info[0] = pt.x;
+        info[1] = pt.y;
+        WriteProcessMemory(self.proc, self.mem, info.as_ptr() as _, 24, std::ptr::null_mut());
+        let hit = SendMessageW(self.lv, LVM_HITTEST, 0, self.mem as isize);
+        (hit >= 0).then_some(hit as usize)
+    }
+
+    unsafe fn icon_at(&self, pt: POINT) -> bool {
+        self.icon_under(pt).is_some()
+    }
+
     unsafe fn position(&self, i: usize) -> (i32, i32) {
         SendMessageW(self.lv, LVM_GETITEMPOSITION, i, self.mem as isize);
         let mut p = POINT { x: 0, y: 0 };
@@ -284,8 +304,24 @@ fn stamp(path: &Path) -> u64 {
     secs(meta.modified()).max(secs(meta.created()))
 }
 
-/// Match each icon's label to its file: (kind, time). Returns also the unclear labels.
-unsafe fn describe(labels: &[String]) -> (Vec<(String, u64)>, Vec<String>) {
+/// Desktop items with no file of their own, by the name Windows shows.
+fn system_path(label: &str) -> Option<PathBuf> {
+    let target = match label.to_lowercase().as_str() {
+        "recycle bin" => "shell:RecycleBinFolder",
+        "this pc" => "shell:MyComputerFolder",
+        "network" => "shell:NetworkPlacesFolder",
+        "control panel" => "shell:ControlPanelFolder",
+        _ => {
+            let profile = home();
+            return profile.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(label)).then_some(profile);
+        }
+    };
+    Some(PathBuf::from(target))
+}
+
+/// Match each icon's label to its file: (kind, time). Returns also the unclear labels, and each
+/// icon's file, where same-named files are shared out in turn so each still opens something real.
+unsafe fn describe(labels: &[String]) -> (Vec<(String, u64)>, Vec<String>, Vec<Option<PathBuf>>) {
     let (mut by_name, mut by_stem): (HashMap<String, PathBuf>, HashMap<String, Vec<PathBuf>>) = Default::default();
     for dir in desktop_dirs() {
         for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -299,7 +335,8 @@ unsafe fn describe(labels: &[String]) -> (Vec<(String, u64)>, Vec<String>) {
     for label in labels {
         *seen.entry(label.to_lowercase()).or_default() += 1;
     }
-    let (mut out, mut unclear) = (vec![], vec![]);
+    let (mut out, mut unclear, mut paths) = (vec![], vec![], vec![]);
+    let mut shared_out: HashSet<PathBuf> = HashSet::new();
     for label in labels {
         let key = label.to_lowercase();
         let stems = by_stem.get(&key);
@@ -313,6 +350,7 @@ unsafe fn describe(labels: &[String]) -> (Vec<(String, u64)>, Vec<String>) {
                 Some(_) => None,
                 None => {
                     out.push(("system".to_string(), 0));
+                    paths.push(system_path(label));
                     continue;
                 }
             }
@@ -320,6 +358,11 @@ unsafe fn describe(labels: &[String]) -> (Vec<(String, u64)>, Vec<String>) {
         let Some(path) = entry else {
             unclear.push(label.clone());
             out.push(("unknown".to_string(), 0));
+            let next = stems.and_then(|s| s.iter().find(|p| !shared_out.contains(*p))).cloned();
+            if let Some(p) = &next {
+                shared_out.insert(p.clone());
+            }
+            paths.push(next);
             continue;
         };
         let kind = if path.is_dir() {
@@ -328,8 +371,17 @@ unsafe fn describe(labels: &[String]) -> (Vec<(String, u64)>, Vec<String>) {
             path.extension().map_or(String::new(), |e| format!(".{}", e.to_string_lossy().to_lowercase()))
         };
         out.push((kind, stamp(path)));
+        paths.push(Some(path.clone()));
     }
-    (out, unclear)
+    if paths.iter().any(|p| p.is_none()) {
+        let items = shellmenu::desktop_items();
+        for (label, path) in labels.iter().zip(paths.iter_mut()) {
+            if path.is_none() {
+                *path = items.get(&label.to_lowercase()).cloned();
+            }
+        }
+    }
+    (out, unclear, paths)
 }
 
 // ---------- layout ----------
@@ -366,6 +418,8 @@ struct Plan {
     unclear: Vec<String>,
     /// The sections that show a folder rather than desktop icons.
     portals: HashMap<String, Portal>,
+    /// Each icon's file, where it has one.
+    paths: Vec<Option<PathBuf>>,
 }
 
 struct Portal {
@@ -398,7 +452,28 @@ fn read_portal(folder: PathBuf) -> Option<Portal> {
 
 /// The icon Windows shows for this file. ponytail: kept for the program's life, as there are few;
 /// free the oldest if a busy folder ever makes this matter.
-unsafe fn file_icon(path: &Path) -> isize {
+/// A file's icon, made again if the file has changed since, so a thumbnail is never out of date.
+unsafe fn cached_icon(icons: &mut HashMap<PathBuf, (u64, isize)>, path: &Path, dpi: f32) -> isize {
+    let changed = stamp(path);
+    if let Some(&(when, icon)) = icons.get(path) {
+        if when == changed {
+            return icon;
+        }
+        DestroyIcon(icon as HICON);
+    }
+    let icon = file_icon(path, dpi);
+    icons.insert(path.to_path_buf(), (changed, icon));
+    icon
+}
+
+unsafe fn file_icon(path: &Path, dpi: f32) -> isize {
+    let sharp = shellmenu::sharp_icon(path, settings::icon_pixels(dpi)); // the size the panel draws it, so nothing is stretched
+    if sharp != 0 {
+        return sharp;
+    }
+    if path.to_string_lossy().starts_with("shell:") {
+        return shellmenu::shell_icon(path);
+    }
     let mut info: SHFILEINFOW = std::mem::zeroed();
     SHGetFileInfoW(wide(&path.to_string_lossy()).as_ptr(), 0, &mut info, std::mem::size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | SHGFI_LARGEICON);
     info.hIcon as isize
@@ -537,7 +612,7 @@ unsafe fn make_plan(desk: &Desktop, cfg: &Config) -> Result<Plan, String> {
             .into());
     }
     let labels: Vec<String> = (0..desk.count()).map(|i| desk.text(i)).collect();
-    let (details, unclear) = describe(&labels);
+    let (details, unclear, paths) = describe(&labels);
     let mut sortable: HashMap<&str, Vec<(std::cmp::Reverse<u64>, String, usize)>> = HashMap::new();
     for (i, (label, (kind, time))) in labels.iter().zip(&details).enumerate() {
         sortable.entry(classify(label, kind, cfg)).or_default().push((std::cmp::Reverse(*time), label.to_lowercase(), i));
@@ -601,10 +676,11 @@ unsafe fn make_plan(desk: &Desktop, cfg: &Config) -> Result<Plan, String> {
             tightened: tighten < 1.0,
             unclear: vec![],
             portals: HashMap::new(),
+            paths: vec![],
         };
         let (room_w, room_h) = plan.panel_room();
         if groups.iter().all(|(_, g)| panel_grid(g.len() as i32, m.cell_w, m.cell_h, room_w, room_h).is_some()) {
-            return Ok(Plan { labels, groups, unclear, portals, ..plan });
+            return Ok(Plan { labels, groups, unclear, portals, paths, ..plan });
         }
     }
     Err(format!("{} icons do not fit on the screen, even with the tightest spacing.", labels.len()))
@@ -629,8 +705,15 @@ enum Command {
     Close,
     Hover(Option<String>),
     Filed(String),
-    SettingsClick(POINT),
-    ToggleRail,
+    SettingsClick(POINT, bool, bool),
+    PanelRepaint,
+    FileMenu(POINT),
+    FiledItems(Vec<String>, String),
+    /// The button came up on a file without a drag.
+    FileRelease(POINT),
+    SelectBox,
+    Key(u32, bool, bool),
+    ToggleRail(POINT),
     Shortcut,
     Changed,
     Light,
@@ -658,8 +741,11 @@ struct Sections {
     login: bool,
     tinted_for: String,
     main_window: usize,
-    icons: HashMap<PathBuf, isize>,
+    icons: HashMap<PathBuf, (u64, isize)>,
     last_file_click: Option<(Instant, PathBuf)>,
+    selected: Vec<PathBuf>,
+    /// Where a Shift press measures from.
+    anchor: i32,
 }
 
 unsafe fn load_plan(desk: &Desktop) -> Result<Plan, String> {
@@ -792,14 +878,32 @@ impl Sections {
                     let files: Vec<_> = portal
                         .files
                         .iter()
-                        .map(|(path, file)| (path.clone(), file.clone(), *self.icons.entry(path.clone()).or_insert_with(|| file_icon(path))))
+                        .map(|(path, file)| (path.clone(), file.clone(), cached_icon(&mut self.icons, path, m.dpi)))
                         .collect();
                     settings::build_portal(name, &portal.folder, &files, portal.total, across, (m.cell_w, m.cell_h), m.pad, m.dpi)
+                }
+                (None, Some((_, across))) if plan.cfg.own_icons => {
+                    let m = plan.m;
+                    let at = plan.index(name).unwrap_or(0);
+                    let files: Vec<_> = plan.groups[at]
+                        .1
+                        .iter()
+                        .map(|&i| {
+                            let path = plan.paths.get(i).cloned().flatten();
+                            let icon = path.as_ref().map_or(0, |p| cached_icon(&mut self.icons, p, m.dpi));
+                            (path, plan.labels[i].clone(), icon)
+                        })
+                        .collect();
+                    settings::build_section(&files, across, (m.cell_w, m.cell_h), m.pad)
                 }
                 _ => vec![],
             },
             None => vec![],
         };
+        // the list may have changed, so find the selected file again and let hover be found afresh
+        let selected: Vec<i32> = items.iter().enumerate().filter(|(_, i)| matches!(&i.action, Some(Action::Open(p)) if self.selected.contains(p))).map(|(n, _)| n as i32).collect();
+        *layers::SELECTED_ITEMS.lock().unwrap() = selected;
+        layers::HOVER_ITEM.store(-1, Ordering::Relaxed);
         // a panel of Rivulet's own controls, so clicks in it come here and not to the desktop
         SETTINGS_OPEN.store(!items.is_empty(), Ordering::Relaxed);
         layers::set_settings(items);
@@ -835,7 +939,7 @@ impl Sections {
 
         let shown_panel = open_at.and_then(|at| plan.panel(at).map(|(r, across)| (at, r, across)));
         let mut wanted: HashMap<usize, (i32, i32)> = HashMap::new();
-        if let Some((at, r, across)) = shown_panel {
+        if let Some((at, r, across)) = shown_panel.filter(|_| !plan.cfg.own_icons) {
             for (n, &i) in plan.groups[at].1.iter().enumerate() {
                 wanted.insert(i, plan.cell(r, across, n as i32));
             }
@@ -879,7 +983,8 @@ impl Sections {
     /// Run one open (forward) or close (backward) of a section.
     unsafe fn flow(&mut self, plan: &Plan, at: usize, opening: bool) {
         let Some((full, across)) = plan.panel(at) else { return };
-        let icons = plan.groups[at].1.clone();
+        // Rivulet draws its own icons as part of the panel, so Explorer's stay parked
+        let icons = if plan.cfg.own_icons { vec![] } else { plan.groups[at].1.clone() };
         let m = plan.m;
         layers::set_accent(plan.colour(&plan.groups[at].0));
         let right = plan.cfg.right_side;
@@ -964,6 +1069,11 @@ impl Sections {
     /// Fold up the open section; when another is about to open it just vanishes, for a quick switch.
     unsafe fn close_open(&mut self, plan: &Plan, animate: bool) {
         let previous = self.open.take();
+        self.selected.clear();
+        self.anchor = -1;
+        layers::SELECTED_ITEMS.lock().unwrap().clear();
+        PostMessageW(self.main_window as HWND, WM_GIVE_BACK_KEYS, 0, 0);
+        layers::HOVER_ITEM.store(-1, Ordering::Relaxed);
         if let Some(at) = previous.as_deref().and_then(|s| plan.index(s)) {
             self.show_rail(plan);
             if !animate {
@@ -1075,12 +1185,175 @@ impl Sections {
         self.settle()
     }
 
-    /// A click inside the Settings panel.
-    unsafe fn settings_click(&mut self, pt: POINT) -> Result<(), String> {
-        let Some(panel) = *PANEL_ON_SCREEN.lock().unwrap() else { return Ok(()) };
-        let action = {
+    /// Icons Rivulet drew were dragged onto a label: pin them to that section.
+    unsafe fn file_items(&mut self, labels: Vec<String>, section: String) -> Result<(), String> {
+        let is_portal = |name: &str| self.last_plan.as_ref().is_some_and(|p| p.portals.contains_key(name));
+        if section == RECENT || section == SETTINGS || is_portal(&section) || self.open.as_deref().is_some_and(is_portal) || self.open.as_deref() == Some(section.as_str()) {
+            return Ok(());
+        }
+        let mut text = std::fs::read_to_string(rules_file()).map_err(|e| e.to_string())?;
+        for label in &labels {
+            text = add_name_rule(&text, label, &section);
+        }
+        parse_config(&text)?; // never write a rules file that would not load
+        std::fs::write(rules_file(), text).map_err(|e| e.to_string())?;
+        self.selected.clear();
+        self.last_plan = None;
+        self.settle()
+    }
+
+    /// Draw the open panel again, for a change of hover or selection.
+    unsafe fn repaint_panel(&self) {
+        let (Some(plan), Some(open)) = (&self.last_plan, &self.open) else { return };
+        let Some(at) = plan.index(open) else { return };
+        if let Some((r, _)) = plan.panel(at) {
+            self.draw_open(plan, at, r, 1.0);
+        }
+    }
+
+    /// Make these the chosen files, drawing the change if there is one.
+    unsafe fn select(&mut self, chosen: Vec<i32>) {
+        let paths = {
             let items = layers::SETTINGS_ITEMS.lock().unwrap();
-            settings::action_at(&items, pt.x - panel.left, pt.y - panel.top)
+            chosen.iter().filter_map(|&n| match items.get(n as usize).map(|i| &i.action) {
+                Some(Some(Action::Open(path))) => Some(path.clone()),
+                _ => None,
+            }).collect()
+        };
+        self.selected = paths;
+        let changed = {
+            let mut current = layers::SELECTED_ITEMS.lock().unwrap();
+            let changed = *current != chosen;
+            *current = chosen;
+            changed
+        };
+        if changed {
+            self.repaint_panel();
+        }
+    }
+
+    fn chosen(&self) -> Vec<i32> {
+        layers::SELECTED_ITEMS.lock().unwrap().clone()
+    }
+
+    /// The file at this spot in the panel, and its place in the list.
+    fn file_at(&self, pt: POINT) -> Option<(i32, PathBuf)> {
+        let panel = (*PANEL_ON_SCREEN.lock().unwrap())?;
+        let items = layers::SETTINGS_ITEMS.lock().unwrap();
+        settings::item_at(&items, pt.x - panel.left, pt.y - panel.top).and_then(|n| match &items[n].action {
+            Some(Action::Open(path)) => Some((n as i32, path.clone())),
+            _ => None,
+        })
+    }
+
+    /// The real right-click menu: for all the chosen files if this is one of them, else just this one.
+    unsafe fn file_menu(&mut self, pt: POINT) {
+        if let Some((n, path)) = self.file_at(pt) {
+            if !self.chosen().contains(&n) {
+                self.select(vec![n]);
+                self.anchor = n;
+            }
+            let mut paths = vec![path.clone()];
+            paths.extend(self.selected.iter().filter(|p| **p != path).cloned());
+            self.take_keys();
+            shellmenu::show(paths);
+        }
+    }
+
+    /// Keys go to Rivulet from now until another window is used, rather than to whatever was in front.
+    fn take_keys(&self) {
+        unsafe { PostMessageW(self.main_window as HWND, WM_TAKE_KEYS, 0, 0) };
+    }
+
+    /// The selection box moved: choose what it touches.
+    unsafe fn select_box(&mut self) {
+        BOX_WAITING.store(false, Ordering::Relaxed);
+        let area = *layers::SELECT_BOX.lock().unwrap();
+        if let Some(area) = area {
+            let chosen = settings::in_box(&layers::SETTINGS_ITEMS.lock().unwrap(), area);
+            self.select(chosen);
+        }
+        self.repaint_panel(); // the box itself moved, or has gone
+    }
+
+    /// How many files there are, and how many fit across, for the arrow keys.
+    fn grid(&self) -> Option<(i32, i32)> {
+        let plan = self.last_plan.as_ref()?;
+        let at = plan.index(self.open.as_deref()?)?;
+        let across = plan.panel(at)?.1;
+        let count = layers::SETTINGS_ITEMS.lock().unwrap().iter().filter(|i| matches!(i.look, Look::File(..))).count() as i32;
+        Some((across, count))
+    }
+
+    /// A key, while Rivulet has them. Only files are acted on, and only ones the user chose.
+    unsafe fn key(&mut self, key: u32, ctrl: bool, shift: bool) -> Result<(), String> {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
+        if self.open.is_none() || !layers::SETTINGS_ITEMS.lock().unwrap().iter().any(|i| matches!(i.look, Look::File(..))) {
+            return Ok(());
+        }
+        // portals put a title and a button ahead of their files
+        let first = layers::SETTINGS_ITEMS.lock().unwrap().iter().position(|i| matches!(i.look, Look::File(..))).unwrap_or(0) as i32;
+        let paths = self.selected.clone();
+        let vk = key as u16;
+        match vk {
+            VK_DELETE if !paths.is_empty() => shellmenu::verb(paths, "delete", shift),
+            VK_F2 if paths.len() == 1 => {
+                let at = self.chosen().first().copied().unwrap_or(-1);
+                let spot = {
+                    let items = layers::SETTINGS_ITEMS.lock().unwrap();
+                    let panel = *PANEL_ON_SCREEN.lock().unwrap();
+                    match (items.get(at as usize), panel) {
+                        (Some(i), Some(p)) => POINT { x: p.left + i.rect.left, y: p.top + i.rect.bottom },
+                        _ => POINT { x: 0, y: 0 },
+                    }
+                };
+                shellmenu::rename(paths[0].clone(), spot);
+            }
+            VK_F5 => return self.settle(),
+            VK_RETURN => {
+                for path in &paths {
+                    open_path(path);
+                }
+            }
+            VK_ESCAPE => {
+                if paths.is_empty() {
+                    return self.close();
+                }
+                self.select(vec![]);
+            }
+            VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN => {
+                if let Some((across, count)) = self.grid() {
+                    let way = match vk {
+                        VK_LEFT => Arrow::Left,
+                        VK_RIGHT => Arrow::Right,
+                        VK_UP => Arrow::Up,
+                        _ => Arrow::Down,
+                    };
+                    let at = self.chosen().last().copied().unwrap_or(first) - first;
+                    let to = if self.selected.is_empty() { 0 } else { settings::arrow(at, way, across, count) } + first;
+                    self.select(vec![to]);
+                    self.anchor = to;
+                }
+            }
+            0x41 if ctrl => {
+                let all: Vec<i32> = layers::SETTINGS_ITEMS.lock().unwrap().iter().enumerate().filter(|(_, i)| matches!(i.action, Some(Action::Open(_))) && matches!(i.look, Look::File(..))).map(|(n, _)| n as i32).collect();
+                self.select(all);
+            }
+            0x43 if ctrl && !paths.is_empty() => shellmenu::verb(paths, "copy", false),
+            0x58 if ctrl && !paths.is_empty() => shellmenu::verb(paths, "cut", false),
+            0x56 if ctrl => shellmenu::paste(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// A click inside the Settings panel.
+    unsafe fn settings_click(&mut self, pt: POINT, ctrl: bool, shift: bool) -> Result<(), String> {
+        let Some(panel) = *PANEL_ON_SCREEN.lock().unwrap() else { return Ok(()) };
+        let (action, index) = {
+            let items = layers::SETTINGS_ITEMS.lock().unwrap();
+            let (x, y) = (pt.x - panel.left, pt.y - panel.top);
+            (settings::action_at(&items, x, y), settings::item_at(&items, x, y).map_or(-1, |n| n as i32))
         };
         match action {
             Some(Action::Set(part, key, value)) => {
@@ -1111,6 +1384,15 @@ impl Sections {
                 Ok(())
             }
             Some(Action::Open(path)) => {
+                self.take_keys();
+                self.select(settings::pick(&self.chosen(), index, self.anchor, ctrl, shift));
+                if !shift {
+                    self.anchor = index;
+                }
+                if ctrl || shift {
+                    self.last_file_click = None;
+                    return Ok(());
+                }
                 let limit = Duration::from_millis(GetDoubleClickTime() as u64);
                 if self.last_file_click.take().is_some_and(|(t, p)| t.elapsed() <= limit && p == path) {
                     open_path(&path);
@@ -1123,7 +1405,13 @@ impl Sections {
                 open_path(&path);
                 Ok(())
             }
-            None => Ok(()),
+            None => {
+                self.take_keys();
+                if !ctrl {
+                    self.select(vec![]);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1184,7 +1472,7 @@ unsafe fn restore_spacing(desk: &Desktop) {
 fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Command>, window: usize) {
     unsafe {
         let last_section = open.clone();
-        let mut s = Sections { desk, open, hover: None, hidden: vec![], count: 0, seen: None, last_plan: None, last_section, shortcut_showing: false, rail_hidden: false, login: login_is_on(), tinted_for: String::from("\0"), main_window: window, icons: HashMap::new(), last_file_click: None };
+        let mut s = Sections { desk, open, hover: None, hidden: vec![], count: 0, seen: None, last_plan: None, last_section, shortcut_showing: false, rail_hidden: false, login: login_is_on(), tinted_for: String::from("\0"), main_window: window, icons: HashMap::new(), last_file_click: None, selected: vec![], anchor: -1 };
         CoInitializeEx(std::ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32); // file icons and opening files ask for it
         if let Err(e) = s.settle() {
             log(&format!("first sort failed: {e}"));
@@ -1205,8 +1493,37 @@ fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Com
                     Ok(())
                 }
                 Ok(Command::Filed(section)) => s.file_selected(section),
-                Ok(Command::SettingsClick(pt)) => s.settings_click(pt),
-                Ok(Command::ToggleRail) => s.toggle_rail(),
+                Ok(Command::SettingsClick(pt, ctrl, shift)) => s.settings_click(pt, ctrl, shift),
+                Ok(Command::FileRelease(pt)) => {
+                    // a plain click on one of several, once it is clear it was not a drag
+                    if let Some((n, _)) = s.file_at(pt) {
+                        if s.chosen().len() > 1 && s.chosen().contains(&n) {
+                            s.select(vec![n]);
+                        }
+                    }
+                    Ok(())
+                }
+                Ok(Command::SelectBox) => {
+                    s.select_box();
+                    Ok(())
+                }
+                Ok(Command::Key(key, ctrl, shift)) => s.key(key, ctrl, shift),
+                Ok(Command::PanelRepaint) => {
+                    s.repaint_panel();
+                    Ok(())
+                }
+                Ok(Command::FileMenu(pt)) => {
+                    s.file_menu(pt);
+                    Ok(())
+                }
+                Ok(Command::FiledItems(labels, section)) => s.file_items(labels, section),
+                Ok(Command::ToggleRail(pt)) => {
+                    if s.desk.icon_at(pt) {
+                        Ok(()) // a double-click on an icon opens it; it is not a click on empty desktop
+                    } else {
+                        s.toggle_rail()
+                    }
+                }
                 Ok(Command::Shortcut) => s.shortcut(),
                 Ok(Command::Changed) => {
                     // a refresh arrives as a burst of changes, so let it finish first
@@ -1262,6 +1579,12 @@ static LAST_EMPTY_PRESS: Mutex<Option<(Instant, POINT)>> = Mutex::new(None);
 static LAST_TOGGLE: Mutex<Option<Instant>> = Mutex::new(None);
 static HOVERING: Mutex<Option<String>> = Mutex::new(None);
 static RIGHT_ON_LABEL: AtomicBool = AtomicBool::new(false);
+static RIGHT_ON_FILE: AtomicBool = AtomicBool::new(false);
+/// What a press on a file may drag: the names, for filing under a label, and the files.
+static DRAG_ITEMS: Mutex<Option<(Vec<String>, Vec<PathBuf>)>> = Mutex::new(None);
+static BOX_FROM: Mutex<Option<POINT>> = Mutex::new(None);
+static BOX_WAITING: AtomicBool = AtomicBool::new(false);
+static PLAIN_PRESS: AtomicBool = AtomicBool::new(false);
 static OWNER: AtomicUsize = AtomicUsize::new(0);
 
 unsafe fn over_desktop(pt: POINT) -> bool {
@@ -1279,6 +1602,72 @@ fn label_at(pt: POINT) -> Option<String> {
 
 fn in_panel(pt: POINT) -> bool {
     PANEL_ON_SCREEN.try_lock().is_ok_and(|p| p.is_some_and(|r| pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom))
+}
+
+/// The drawn file under the mouse: its place in the list and its name, or None. The mouse hook calls
+/// this, so it never waits and never asks Explorer anything. Outer None means busy, so try next time.
+unsafe fn file_under(pt: POINT) -> Option<Option<(i32, String, isize)>> {
+    if !SETTINGS_OPEN.load(Ordering::Relaxed) || !in_panel(pt) || !over_desktop(pt) {
+        return Some(None);
+    }
+    let panel = (*PANEL_ON_SCREEN.try_lock().ok()?)?;
+    let items = layers::SETTINGS_ITEMS.try_lock().ok()?;
+    Some(settings::item_at(&items, pt.x - panel.left, pt.y - panel.top).and_then(|n| match &items[n].look {
+        Look::File(name, icon) => Some((n as i32, name.clone(), *icon)),
+        _ => None,
+    }))
+}
+
+fn panel_has_files() -> bool {
+    layers::SETTINGS_ITEMS.try_lock().is_ok_and(|items| items.iter().any(|i| matches!(i.look, Look::File(..))))
+}
+
+/// A drag from this file takes all the chosen files if it is one of them, and otherwise only itself.
+fn what_a_drag_takes(n: i32, name: String) -> Option<(Vec<String>, Vec<PathBuf>)> {
+    let items = layers::SETTINGS_ITEMS.try_lock().ok()?;
+    let chosen = layers::SELECTED_ITEMS.try_lock().ok()?;
+    let take: Vec<usize> = if chosen.contains(&n) { chosen.iter().map(|&c| c as usize).collect() } else { vec![n as usize] };
+    let (mut names, mut paths) = (vec![], vec![]);
+    // the pressed one first, so its folder decides what can go together
+    for i in std::iter::once(n as usize).chain(take.into_iter().filter(|&c| c != n as usize)) {
+        if let (Some(Look::File(file, _)), Some(Some(Action::Open(path)))) = (items.get(i).map(|x| &x.look), items.get(i).map(|x| &x.action)) {
+            names.push(file.clone());
+            paths.push(path.clone());
+        }
+    }
+    let _ = name;
+    Some((names, paths))
+}
+
+/// The selection box follows the mouse, kept inside the panel.
+fn box_moved(pt: POINT) {
+    let Ok(from) = BOX_FROM.try_lock() else { return };
+    let Some(from) = *from else { return };
+    let Some(panel) = PANEL_ON_SCREEN.try_lock().ok().and_then(|p| *p) else { return };
+    if (from.x - pt.x).abs() < 4 && (from.y - pt.y).abs() < 4 {
+        return;
+    }
+    let clamp = |v: i32, low: i32, high: i32| v.max(low).min(high);
+    let (x, y) = (clamp(pt.x, panel.left, panel.right), clamp(pt.y, panel.top, panel.bottom));
+    let area = RECT { left: from.x.min(x) - panel.left, top: from.y.min(y) - panel.top, right: from.x.max(x) - panel.left, bottom: from.y.max(y) - panel.top };
+    if let Ok(mut shown) = layers::SELECT_BOX.try_lock() {
+        *shown = Some(area);
+    }
+    if !BOX_WAITING.swap(true, Ordering::Relaxed) {
+        send(Command::SelectBox);
+    }
+}
+
+/// The button came up: end a selection box, if one was started. True if one had been drawn.
+fn box_ended() -> bool {
+    if let Ok(mut from) = BOX_FROM.try_lock() {
+        *from = None;
+    }
+    let drawn = layers::SELECT_BOX.try_lock().is_ok_and(|mut b| b.take().is_some());
+    if drawn {
+        send(Command::SelectBox);
+    }
+    drawn
 }
 
 /// Two quick presses in nearly the same spot on empty desktop.
@@ -1306,7 +1695,24 @@ unsafe fn left_down(pt: POINT) -> bool {
         }
     } else if in_panel(pt) {
         if SETTINGS_OPEN.load(Ordering::Relaxed) {
-            send(Command::SettingsClick(pt));
+            use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_SHIFT};
+            let (ctrl, shift) = (GetAsyncKeyState(VK_CONTROL as i32) < 0, GetAsyncKeyState(VK_SHIFT as i32) < 0);
+            PLAIN_PRESS.store(!ctrl && !shift, Ordering::Relaxed);
+            match file_under(pt) {
+                Some(Some((n, name, icon))) if !ctrl && !shift => {
+                    if let (Ok(mut drag), Some(what)) = (DRAG_ITEMS.try_lock(), what_a_drag_takes(n, name)) {
+                        *drag = Some(what);
+                        ghost::press(pt, icon, settings::icon_pixels(windows_sys::Win32::UI::HiDpi::GetDpiForSystem() as f32 / 96.0));
+                    }
+                }
+                Some(None) if panel_has_files() => {
+                    if let Ok(mut from) = BOX_FROM.try_lock() {
+                        *from = Some(pt);
+                    }
+                }
+                _ => {}
+            }
+            send(Command::SettingsClick(pt, ctrl, shift));
             return true; // a control, so no selection box should start on the desktop
         }
         DRAG_FROM_PANEL.store(true, Ordering::Relaxed);
@@ -1315,7 +1721,7 @@ unsafe fn left_down(pt: POINT) -> bool {
             send(Command::Close);
         }
         if DOUBLE_CLICK_HIDES.load(Ordering::Relaxed) && is_double_press(pt) {
-            send(Command::ToggleRail);
+            send(Command::ToggleRail(pt));
         }
     }
     false
@@ -1330,6 +1736,25 @@ unsafe fn left_up(pt: POINT) {
 }
 
 fn mouse_moved(pt: POINT) {
+    unsafe {
+        ghost::moved(pt);
+        // over another program a drag becomes a real Windows drag; on the desktop it is for the labels
+        if ghost::dragging() && !over_desktop(pt) {
+            if let Some((_, paths)) = DRAG_ITEMS.try_lock().ok().and_then(|mut d| d.take()) {
+                ghost::release();
+                SWALLOW_RELEASE.store(false, Ordering::Relaxed);
+                shellmenu::begin_drag(paths);
+                return;
+            }
+        }
+    }
+    box_moved(pt);
+    if let Some(under) = unsafe { file_under(pt) } {
+        let item = under.map_or(-1, |(n, ..)| n);
+        if layers::HOVER_ITEM.swap(item, Ordering::Relaxed) != item {
+            send(Command::PanelRepaint); // only on moving to another icon, never within one
+        }
+    }
     let hit = label_at(pt).filter(|_| unsafe { over_desktop(pt) });
     if let Ok(mut hovering) = HOVERING.try_lock() {
         if *hovering != hit {
@@ -1341,7 +1766,11 @@ fn mouse_moved(pt: POINT) {
 
 /// Windows drops a mouse hook that answers slowly, so this only notes the event; the worker does the work.
 unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 {
+    if code >= 0 && shellmenu::SHELL_BUSY.load(Ordering::Relaxed) {
+        if wparam as u32 == WM_LBUTTONUP {
+            shellmenu::note_release();
+        }
+    } else if code >= 0 {
         let pt = (*(lparam as *const MSLLHOOKSTRUCT)).pt;
         match wparam as u32 {
             WM_MOUSEMOVE => {
@@ -1358,6 +1787,17 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
             }
             WM_LBUTTONUP => {
                 if SWALLOW_RELEASE.swap(false, Ordering::Relaxed) {
+                    let dragged = ghost::release();
+                    box_ended();
+                    if let Some((names, _)) = DRAG_ITEMS.try_lock().ok().and_then(|mut d| d.take()) {
+                        if !dragged {
+                            if PLAIN_PRESS.load(Ordering::Relaxed) {
+                                send(Command::FileRelease(pt));
+                            }
+                        } else if let Some(section) = label_at(pt) {
+                            send(Command::FiledItems(names, section));
+                        }
+                    }
                     return 1;
                 }
                 left_up(pt);
@@ -1365,6 +1805,14 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
             WM_RBUTTONDOWN if over_desktop(pt) && label_at(pt).is_some() => {
                 RIGHT_ON_LABEL.store(true, Ordering::Relaxed);
                 return 1; // our menu, not the desktop's
+            }
+            WM_RBUTTONDOWN if matches!(file_under(pt), Some(Some(_))) => {
+                RIGHT_ON_FILE.store(true, Ordering::Relaxed);
+                return 1; // the file's menu, not the desktop's
+            }
+            WM_RBUTTONUP if RIGHT_ON_FILE.swap(false, Ordering::Relaxed) => {
+                send(Command::FileMenu(pt));
+                return 1;
             }
             WM_RBUTTONUP if RIGHT_ON_LABEL.swap(false, Ordering::Relaxed) => {
                 PostMessageW(OWNER.load(Ordering::Relaxed) as HWND, WM_MENU, 0, 0);
@@ -1414,7 +1862,7 @@ fn run_undo() {
 
 /// Dark menus. Windows has no public switch for this, so it is looked up by number; if a future
 /// version drops it, the menu simply stays light.
-unsafe fn dark_menus() {
+pub unsafe fn dark_menus() {
     const SET_PREFERRED_APP_MODE: usize = 135;
     const FLUSH_MENU_THEMES: usize = 136;
     const FORCE_DARK: i32 = 2;
@@ -1459,6 +1907,20 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         WM_STOP => send(Command::Stop),
         WM_HOTKEY => send(Command::Shortcut),
         WM_MENU => show_menu(hwnd),
+        WM_TAKE_KEYS => {
+            shellmenu::to_front(hwnd);
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(hwnd);
+        }
+        WM_GIVE_BACK_KEYS => {
+            // back to the desktop, unless the user has already gone to another window
+            if GetForegroundWindow() == hwnd {
+                SetForegroundWindow(GetShellWindow());
+            }
+        }
+        WM_KEYDOWN => {
+            use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
+            send(Command::Key(wparam as u32, GetKeyState(VK_CONTROL as i32) < 0, GetKeyState(VK_SHIFT as i32) < 0));
+        }
         WM_REMAKE => {
             if let Err(e) = layers::create() {
                 eprintln!("{e}");

@@ -192,3 +192,22 @@ float4 glass(float4 position : SV_Position) : SV_Target {
 float4 words(float4 position : SV_Position) : SV_Target {
     return picture.Load(int3(position.xy, 0));
 }
+
+// Text with each of red, green and blue covered by its own amount, as ClearType asks: t0 holds the
+// colour already mixed with that amount, t1 the amounts. The second output tells the blend how much
+// of the glass to keep behind each colour.
+Texture2D text_cover : register(t1);
+
+struct NamesOut {
+    float4 colour : SV_Target0;
+    float4 keep : SV_Target1;
+};
+
+NamesOut names(float4 position : SV_Position) {
+    float3 cover = text_cover.Load(int3(position.xy, 0)).rgb;
+    float most = max(cover.r, max(cover.g, cover.b));
+    NamesOut out_;
+    out_.colour = float4(picture.Load(int3(position.xy, 0)).rgb, most);
+    out_.keep = float4(cover, most);
+    return out_;
+}

@@ -26,6 +26,8 @@ pub struct Config {
     pub style: String,
     /// Sections that show a folder: (label, folder, which may name %VARIABLES%).
     pub portals: Vec<(String, String)>,
+    /// Draw the icons in the panel and keep Explorer's own icons parked.
+    pub own_icons: bool,
 }
 
 /// A path with each %NAME% replaced by that variable's value. Unknown names stay as written.
@@ -123,6 +125,7 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
         double_click_hide: true,
         style: "plain".to_string(),
         portals: vec![],
+        own_icons: false,
     };
     let mut old_pretty = false;
     let mut style_given = false;
@@ -185,6 +188,11 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
                 "dots" => cfg.dots = on_off(&key, value)?,
                 "click_away" => cfg.click_away = on_off(&key, value)?,
                 "double_click_hide" => cfg.double_click_hide = on_off(&key, value)?,
+                "icons" => match value {
+                    "explorer" => cfg.own_icons = false,
+                    "own" => cfg.own_icons = true,
+                    _ => return Err(format!("sections.ini: icons should be explorer or own: {line}")),
+                },
                 "pretty" => old_pretty = on_off(&key, value)?, // from before there were styles
                 "style" => {
                     if !matches!(value, "plain" | "smooth" | "glass" | "liquid" | "aurora" | "neon") {
@@ -478,6 +486,15 @@ mod tests {
         assert_eq!(with("style = liquid"), "liquid");
         assert_eq!(with("style = aurora"), "aurora");
         assert_eq!(with("style = neon"), "neon");
+    }
+
+    #[test]
+    fn own_icons_choice() {
+        let with = |general: &str| parse_config(&format!("[types]\nOther =\n[layout]\ncolumn1 = Other\n[general]\n{general}\n"));
+        assert!(!with("").unwrap().own_icons); // off unless asked for
+        assert!(with("icons = own").unwrap().own_icons);
+        assert!(!with("icons = explorer").unwrap().own_icons);
+        assert!(with("icons = maybe").is_err());
     }
 
     #[test]

@@ -6,7 +6,7 @@ use crate::rules::{blend, neck_outline};
 use crate::settings::{Item, Look};
 use crate::wallpaper::wide;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -45,9 +45,16 @@ pub struct Pill {
 
 pub static PILLS: Mutex<Vec<Pill>> = Mutex::new(Vec::new());
 pub static SETTINGS_ITEMS: Mutex<Vec<Item>> = Mutex::new(Vec::new());
+/// Indices into SETTINGS_ITEMS, or -1 for none.
+pub static HOVER_ITEM: AtomicI32 = AtomicI32::new(-1);
+pub static SELECTED_ITEMS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+/// The selection box being drawn, inside the panel.
+pub static SELECT_BOX: Mutex<Option<RECT>> = Mutex::new(None);
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Style {
+    /// A file's name under its icon, the size Explorer uses.
+    Name,
     Label,
     Small,
     Heading,
@@ -61,19 +68,23 @@ pub trait Canvas {
         self.fill(r, radius, colour);
     }
     fn fill(&mut self, r: RECT, radius: i32, colour: u32);
+    /// A see-through colour wash; plain Windows has none, so it falls back to a darker fill.
+    fn wash(&mut self, r: RECT, radius: i32, colour: u32, alpha: u8) {
+        self.fill(r, radius, blend(colour, 0x000000, 1.0 - alpha as f32 / 255.0));
+    }
     fn text(&mut self, r: RECT, s: &str, colour: u32, style: Style, flags: u32);
     fn icon(&mut self, x: i32, y: i32, size: i32, icon: isize);
 }
 
 struct GdiCanvas {
     dc: HDC,
-    fonts: [HFONT; 4],
+    fonts: [HFONT; 5],
 }
 
 impl GdiCanvas {
     unsafe fn new(dc: HDC, dpi: f32) -> GdiCanvas {
         SetBkMode(dc, TRANSPARENT as _);
-        GdiCanvas { dc, fonts: [font("Segoe UI", 13.0 * dpi, 600), font("Segoe UI", 11.0 * dpi, 400), font("Segoe UI", 14.0 * dpi, 700), font("Segoe MDL2 Assets", 14.0 * dpi, 400)] }
+        GdiCanvas { dc, fonts: [font("Segoe UI", 13.0 * dpi, 600), font("Segoe UI", 11.0 * dpi, 400), font("Segoe UI", 14.0 * dpi, 700), font("Segoe MDL2 Assets", 14.0 * dpi, 400), font("Segoe UI", (12.0 * dpi).round(), 400)] }
     }
 }
 
@@ -111,12 +122,14 @@ impl Canvas for GdiCanvas {
                 Style::Small => 1,
                 Style::Heading => 2,
                 Style::Glyph => 3,
+                Style::Name => 4,
             };
             SelectObject(self.dc, self.fonts[index] as _);
             SetTextColor(self.dc, colour);
             let w: Vec<u16> = s.encode_utf16().collect();
             let mut area = r;
-            DrawTextW(self.dc, w.as_ptr() as _, w.len() as i32, &mut area, flags | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            let lines = if flags & DT_WORDBREAK != 0 { DT_EDITCONTROL } else { DT_VCENTER | DT_SINGLELINE };
+            DrawTextW(self.dc, w.as_ptr() as _, w.len() as i32, &mut area, flags | lines | DT_NOPREFIX);
         }
     }
 
@@ -216,6 +229,17 @@ pub unsafe fn set_settings(items: Vec<Item>) {
     InvalidateRect(panel(), null(), 0);
 }
 
+/// Each style's font: name, size at 100% scale, weight.
+pub fn style_font(style: Style) -> (&'static str, f32, i32) {
+    match style {
+        Style::Name => ("Segoe UI", 12.0, 400),
+        Style::Label => ("Segoe UI", 13.0, 600),
+        Style::Small => ("Segoe UI", 11.0, 400),
+        Style::Heading => ("Segoe UI", 14.0, 700),
+        Style::Glyph => ("Segoe MDL2 Assets", 14.0, 400),
+    }
+}
+
 unsafe fn font(name: &str, size: f32, weight: i32) -> HFONT {
     CreateFontW(-size as i32, 0, 0, 0, weight, 0, 0, 0, 0, 0, 0, CLEARTYPE_QUALITY as u32, 0, wide(name).as_ptr())
 }
@@ -256,8 +280,9 @@ pub fn paint_rail_on(c: &mut dyn Canvas, dpi: f32, base: u32) {
 pub fn paint_settings_on(c: &mut dyn Canvas, dpi: f32, base: u32, accent: u32) {
     let radius = (10.0 * dpi) as i32;
     let idle = blend(base, WHITE, 0.10);
+    let chosen = SELECTED_ITEMS.lock().map(|s| s.clone()).unwrap_or_default();
     if let Ok(items) = SETTINGS_ITEMS.lock() {
-        for item in items.iter() {
+        for (index, item) in items.iter().enumerate() {
             let r = item.rect;
             match &item.look {
                 Look::Heading(t) => c.text(r, t, WHITE, Style::Heading, DT_LEFT),
@@ -265,12 +290,19 @@ pub fn paint_settings_on(c: &mut dyn Canvas, dpi: f32, base: u32, accent: u32) {
                 Look::Note(t) => c.text(r, t, SOFT, Style::Small, DT_LEFT),
                 Look::Value(t) => c.text(r, t, WHITE, Style::Label, DT_CENTER),
                 Look::File(name, icon) => {
-                    let size = (32.0 * dpi) as i32;
+                    let selected = chosen.contains(&(index as i32));
+                    let hovered = HOVER_ITEM.load(Ordering::Relaxed) == index as i32;
+                    if selected || hovered {
+                        let inset = (3.0 * dpi) as i32;
+                        let wash = RECT { left: r.left + inset, top: r.top + inset, right: r.right - inset, bottom: r.bottom - inset };
+                        c.wash(wash, (10.0 * dpi) as i32, accent, if selected { 140 } else { 90 });
+                    }
+                    let size = crate::settings::icon_pixels(dpi);
                     let top = r.top + (6.0 * dpi) as i32;
                     c.icon((r.left + r.right - size) / 2, top, size, *icon);
                     let inset = (5.0 * dpi) as i32;
-                    let words = RECT { left: r.left + inset, top: top + size + inset / 2, right: r.right - inset, bottom: top + size + (24.0 * dpi) as i32 };
-                    c.text(words, name, WHITE, Style::Small, DT_CENTER | DT_END_ELLIPSIS);
+                    let words = RECT { left: r.left + inset, top: top + size + inset / 2, right: r.right - inset, bottom: top + size + (38.0 * dpi) as i32 };
+                    c.text(words, name, WHITE, Style::Name, DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
                 }
                 Look::Button(t) => {
                     c.fill(r, radius, idle);
@@ -290,6 +322,9 @@ pub fn paint_settings_on(c: &mut dyn Canvas, dpi: f32, base: u32, accent: u32) {
                 }
             }
         }
+    }
+    if let Ok(Some(area)) = SELECT_BOX.lock().map(|b| *b) {
+        c.wash(area, (4.0 * dpi) as i32, accent, 70);
     }
 }
 

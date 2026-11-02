@@ -19,7 +19,6 @@ use windows::Win32::Graphics::DirectComposition::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows_sys::Win32::Foundation::{HWND, RECT};
-use windows_sys::Win32::Graphics::Gdi::{DT_CENTER, DT_END_ELLIPSIS, DT_RIGHT};
 use windows_sys::Win32::Graphics::GdiPlus::*;
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
@@ -377,7 +376,7 @@ impl Page {
         GdipCreateBitmapFromScan0(w, h, w * 4, PARGB, pixels.as_mut_ptr() as *mut u8, &mut bitmap);
         GdipGetImageGraphicsContext(bitmap as _, &mut g);
         GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
-        GdipSetTextRenderingHint(g, TextRenderingHintAntiAlias);
+        GdipSetTextRenderingHint(g, TextRenderingHintAntiAliasGridFit); // letters lined up with the pixels
         Page { w, h, pixels, bitmap, g }
     }
 
@@ -416,6 +415,246 @@ struct PlusCanvas {
     alpha: u8,
     /// Liquid: the card draws the labels' glass, and words get a soft shadow to stand out on it.
     liquid: bool,
+    /// Where text goes, so it can have ClearType.
+    text: TextTarget,
+}
+
+/// A page, and how to reach it from the coordinates the rail and panels are laid out in.
+#[derive(Clone, Copy)]
+struct TextTarget {
+    page: *mut u32,
+    /// The card's copies, as big as the page. Null: blend straight into the page.
+    colour: *mut u32,
+    cover: *mut u32,
+    w: i32,
+    h: i32,
+    origin: (i32, i32),
+    /// left, top, right, bottom on the page: the panel, however far it has opened.
+    clip: (i32, i32, i32, i32),
+    drew: *mut bool,
+}
+
+/// One colour channel of text over what is under it: `amount` of the text, the rest of the page.
+fn mix_channel(under: u32, colour: u32, amount: u32) -> u32 {
+    (colour * amount + under * (255 - amount)) / 255
+}
+
+/// This colour (as 0xAARRGGBB) at these red, green and blue amounts over a page pixel, with its
+/// colours already mixed with its transparency.
+fn lcd_over(under: u32, cover: u32, colour: u32) -> u32 {
+    let byte = |v: u32, shift: u32| (v >> shift) & 255;
+    let part = |shift: u32| mix_channel(byte(under, shift), byte(colour, shift), byte(cover, shift)) << shift;
+    let most = byte(cover, 0).max(byte(cover, 8)).max(byte(cover, 16));
+    part(0) | part(8) | part(16) | ((byte(under, 24) + (255 - byte(under, 24)) * most / 255) << 24)
+}
+
+/// The text's colour times its amounts, per channel, ready for the card.
+fn colour_for_card(cover: u32, colour: u32) -> u32 {
+    let byte = |v: u32, shift: u32| (v >> shift) & 255;
+    let part = |shift: u32| (byte(colour, shift) * byte(cover, shift) / 255) << shift;
+    part(0) | part(8) | part(16)
+}
+
+/// Black at this strength over a page pixel.
+fn shade(under: u32, strength: u32) -> u32 {
+    let part = |shift: u32| (under >> shift) & 255;
+    let colour = |shift: u32| (part(shift) * (255 - strength) / 255) << shift;
+    colour(0) | colour(8) | colour(16) | ((part(24) + (255 - part(24)) * strength / 255) << 24)
+}
+
+/// The most of a name that fits. `fits` says if a text does; a name cut short ends in an ellipsis.
+fn longest_fit(name: &str, fits: &mut dyn FnMut(&str) -> bool) -> String {
+    if fits(name) {
+        return name.to_string();
+    }
+    let letters: Vec<char> = name.chars().collect();
+    for keep in (1..letters.len()).rev() {
+        let cut: String = letters[..keep].iter().chain(std::iter::once(&'\u{2026}')).collect();
+        if fits(&cut) {
+            return cut;
+        }
+    }
+    "\u{2026}".to_string()
+}
+
+type TileKey = (String, i32, i32, u8, u32, i32);
+
+thread_local! {
+    /// Text as ClearType drew it, kept because a redraw hardly ever changes any words.
+    static TILES: std::cell::RefCell<std::collections::HashMap<TileKey, std::rc::Rc<Vec<u32>>>> = Default::default();
+}
+
+/// Some text in white on black, drawn by Windows with ClearType: each pixel's colours are the amounts.
+unsafe fn text_tile(text: &str, w: i32, h: i32, style: Style, flags: u32, dpi: f32) -> std::rc::Rc<Vec<u32>> {
+    use windows_sys::Win32::Graphics::Gdi::*;
+    let (face, size, weight) = layers::style_font(style);
+    let pixels = (size * dpi).round() as i32;
+    let key = (text.to_string(), w, h, style as u8, flags, pixels);
+    if let Some(tile) = TILES.with(|t| t.borrow().get(&key).cloned()) {
+        return tile;
+    }
+    let mut info: BITMAPINFO = std::mem::zeroed();
+    info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    info.bmiHeader.biWidth = w;
+    info.bmiHeader.biHeight = -h;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    let dc = CreateCompatibleDC(std::ptr::null_mut());
+    let mut bits = std::ptr::null_mut();
+    let dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+    let mut out = vec![0u32; (w * h) as usize];
+    if !dib.is_null() {
+        let old = SelectObject(dc, dib as _);
+        const CLEARTYPE: u32 = 5;
+        let font = CreateFontW(-pixels, 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, CLEARTYPE, 0, wide(face).as_ptr());
+        let old_font = SelectObject(dc, font as _);
+        SetBkMode(dc, TRANSPARENT as _);
+        SetTextColor(dc, 0x00FFFFFF);
+        let mut area = RECT { left: 0, top: 0, right: w, bottom: h };
+        if flags & DT_WORDBREAK != 0 {
+            let lines = (flags & !DT_END_ELLIPSIS) | DT_EDITCONTROL | DT_NOPREFIX;
+            let fitted = longest_fit(text, &mut |t| {
+                let t: Vec<u16> = t.encode_utf16().collect();
+                let mut measured = RECT { left: 0, top: 0, right: w, bottom: h };
+                DrawTextW(dc, t.as_ptr() as _, t.len() as i32, &mut measured, lines | DT_CALCRECT);
+                measured.bottom <= h && measured.right <= w
+            });
+            let t: Vec<u16> = fitted.encode_utf16().collect();
+            DrawTextW(dc, t.as_ptr() as _, t.len() as i32, &mut area, lines);
+        } else {
+            let t: Vec<u16> = text.encode_utf16().collect();
+            DrawTextW(dc, t.as_ptr() as _, t.len() as i32, &mut area, flags | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+        GdiFlush();
+        std::ptr::copy_nonoverlapping(bits as *const u32, out.as_mut_ptr(), out.len());
+        SelectObject(dc, old_font);
+        DeleteObject(font as _);
+        SelectObject(dc, old);
+        DeleteObject(dib as _);
+    }
+    DeleteDC(dc);
+    let tile = std::rc::Rc::new(out);
+    TILES.with(|t| {
+        let mut t = t.borrow_mut();
+        if t.len() > 2000 {
+            t.clear(); // a long-running program must not keep every name it ever saw
+        }
+        t.insert(key, tile.clone());
+    });
+    tile
+}
+
+unsafe fn draw_text(t: &TextTarget, r: RECT, text: &str, colour: u32, style: Style, flags: u32, dpi: f32) {
+    let (w, h) = (r.right - r.left, r.bottom - r.top);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let tile = text_tile(text, w, h, style, flags, dpi);
+    let at = |x: i32, y: i32| -> Option<usize> {
+        let (l, top, right, bottom) = t.clip;
+        (x >= l.max(0) && x < right.min(t.w) && y >= top.max(0) && y < bottom.min(t.h)).then(|| (y * t.w + x) as usize)
+    };
+    let (left, top) = (t.origin.0 + r.left, t.origin.1 + r.top);
+    let colour = argb(colour, 255);
+    if !t.colour.is_null() {
+        // Liquid: a soft shadow on the words page, under where the card will put the text
+        let drop = dpi.round() as i32;
+        let small = matches!(style, Style::Small | Style::Name);
+        let offsets: &[(i32, i32)] = if small { &[(0, 1)] } else { &[(0, 1), (1, 1)] };
+        for &(dx, dy) in offsets {
+            for y in 0..h {
+                for x in 0..w {
+                    let c = tile[(y * w + x) as usize];
+                    let most = (c & 255).max((c >> 8) & 255).max((c >> 16) & 255);
+                    if most > 0 {
+                        if let Some(i) = at(left + x + dx * drop, top + y + dy * drop) {
+                            *t.page.add(i) = shade(*t.page.add(i), most * 88 / 255);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let cover = tile[(y * w + x) as usize] & 0x00FF_FFFF;
+            if cover == 0 {
+                continue;
+            }
+            if let Some(i) = at(left + x, top + y) {
+                if t.colour.is_null() {
+                    *t.page.add(i) = lcd_over(*t.page.add(i), cover, colour);
+                } else {
+                    *t.colour.add(i) = colour_for_card(cover, colour);
+                    *t.cover.add(i) = cover;
+                }
+                *t.drew = true;
+            }
+        }
+    }
+}
+
+/// The text of one piece of glass, for the card to blend over it, the size of that piece's page.
+#[derive(Default)]
+struct TextLayer {
+    colour: Vec<u32>,
+    cover: Vec<u32>,
+    textures: Option<(ID3D11Texture2D, ID3D11Texture2D, ID3D11ShaderResourceView, ID3D11ShaderResourceView, i32, i32)>,
+    showing: bool,
+    size: (i32, i32),
+}
+
+impl TextLayer {
+    /// Start a new drawing: everything clear, and a target that puts text here and shadows on the page.
+    fn begin(&mut self, page: &mut Page, origin: (i32, i32), clip: (i32, i32, i32, i32), drew: *mut bool) -> TextTarget {
+        let n = (page.w * page.h) as usize;
+        self.colour.clear();
+        self.colour.resize(n, 0);
+        self.cover.clear();
+        self.cover.resize(n, 0);
+        self.size = (page.w, page.h);
+        TextTarget { page: page.pixels.as_mut_ptr(), colour: self.colour.as_mut_ptr(), cover: self.cover.as_mut_ptr(), w: page.w, h: page.h, origin, clip, drew }
+    }
+
+    /// Copy the text to the card.
+    unsafe fn upload(&mut self, device: &ID3D11Device, context: &ID3D11DeviceContext, drew: bool) {
+        self.showing = drew;
+        if !drew {
+            return;
+        }
+        let (w, h) = self.size;
+        if !self.textures.as_ref().is_some_and(|t| t.4 == w && t.5 == h) {
+            self.textures = None;
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: w as u32,
+                Height: h as u32,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                ..Default::default()
+            };
+            let make = || -> Option<(ID3D11Texture2D, ID3D11ShaderResourceView)> {
+                let (mut texture, mut view) = (None, None);
+                device.CreateTexture2D(&desc, None, Some(&mut texture)).ok()?;
+                let texture = texture?;
+                device.CreateShaderResourceView(&texture, None, Some(&mut view)).ok()?;
+                Some((texture, view?))
+            };
+            let (Some(a), Some(b)) = (make(), make()) else { self.showing = false; return };
+            self.textures = Some((a.0, b.0, a.1, b.1, w, h));
+        }
+        if let Some(t) = &self.textures {
+            context.UpdateSubresource(&t.0, 0, None, self.colour.as_ptr() as *const c_void, (w * 4) as u32, 0);
+            context.UpdateSubresource(&t.1, 0, None, self.cover.as_ptr() as *const c_void, (w * 4) as u32, 0);
+        }
+    }
+
+    fn views(&self) -> Option<(ID3D11ShaderResourceView, ID3D11ShaderResourceView)> {
+        self.textures.as_ref().filter(|_| self.showing).map(|t| (t.2.clone(), t.3.clone()))
+    }
 }
 
 impl Canvas for PlusCanvas {
@@ -441,43 +680,24 @@ impl Canvas for PlusCanvas {
         }
     }
 
-    fn text(&mut self, r: RECT, s: &str, colour: u32, style: Style, flags: u32) {
+    fn wash(&mut self, r: RECT, radius: i32, colour: u32, alpha: u8) {
         unsafe {
-            let (name, size, bold) = match style {
-                Style::Label => ("Segoe UI", 13.0, 1),
-                Style::Small => ("Segoe UI", 11.0, 0),
-                Style::Heading => ("Segoe UI", 14.0, 1),
-                Style::Glyph => ("Segoe MDL2 Assets", 14.0, 0),
-            };
-            let (mut family, mut font, mut brush, mut format) = (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
-            GdipCreateFontFamilyFromName(wide(name).as_ptr(), std::ptr::null_mut(), &mut family);
-            GdipCreateFont(family, size * self.dpi, bold, UNIT_PIXEL, &mut font);
-            GdipCreateSolidFill(argb(colour, 255), &mut brush);
-            GdipCreateStringFormat(StringFormatFlagsNoWrap as i32, 0, &mut format);
-            let align = if flags & DT_CENTER != 0 { StringAlignmentCenter } else if flags & DT_RIGHT != 0 { StringAlignmentFar } else { StringAlignmentNear };
-            GdipSetStringFormatAlign(format, align);
-            GdipSetStringFormatLineAlign(format, StringAlignmentCenter);
-            if flags & DT_END_ELLIPSIS != 0 {
-                GdipSetStringFormatTrimming(format, StringTrimmingEllipsisCharacter);
+            let mut brush = std::ptr::null_mut();
+            GdipCreateSolidFill(argb(colour, alpha), &mut brush);
+            let (w, h) = ((r.right - r.left) as f32, (r.bottom - r.top) as f32);
+            if radius <= 0 {
+                GdipFillRectangle(self.g, brush as _, r.left as f32, r.top as f32, w, h);
+            } else {
+                let path = round_path(r.left as f32, r.top as f32, w, h, radius as f32);
+                GdipFillPath(self.g, brush as _, path);
+                GdipDeletePath(path);
             }
-            let area = RectF { X: r.left as f32, Y: r.top as f32, Width: (r.right - r.left) as f32, Height: (r.bottom - r.top) as f32 };
-            if self.liquid {
-                let mut dark = std::ptr::null_mut();
-                GdipCreateSolidFill(0x58000000, &mut dark);
-                let small_text = matches!(style, Style::Small);
-                let offsets: &[(f32, f32)] = if small_text { &[(0.0, 1.0)] } else { &[(0.0, 1.0), (1.0, 1.0)] };
-                for &(dx, dy) in offsets {
-                    let under = RectF { X: area.X + dx * self.dpi, Y: area.Y + dy * self.dpi, ..area };
-                    GdipDrawString(self.g, wide(s).as_ptr(), -1, font, &under, format, dark as _);
-                }
-                GdipDeleteBrush(dark as _);
-            }
-            GdipDrawString(self.g, wide(s).as_ptr(), -1, font, &area, format, brush as _);
-            GdipDeleteStringFormat(format);
             GdipDeleteBrush(brush as _);
-            GdipDeleteFont(font);
-            GdipDeleteFontFamily(family);
         }
+    }
+
+    fn text(&mut self, r: RECT, s: &str, colour: u32, style: Style, flags: u32) {
+        unsafe { draw_text(&self.text, r, s, colour, style, flags, self.dpi) }
     }
 
     fn icon(&mut self, x: i32, y: i32, size: i32, icon: isize) {
@@ -498,7 +718,12 @@ impl Canvas for PlusCanvas {
                 windows_sys::Win32::UI::WindowsAndMessaging::DrawIconEx(dc, 0, 0, icon as _, size, size, 0, std::ptr::null_mut(), windows_sys::Win32::UI::WindowsAndMessaging::DI_NORMAL);
                 let mut picture = std::ptr::null_mut();
                 if GdipCreateBitmapFromScan0(size, size, size * 4, PARGB, bits as *mut u8, &mut picture) == 0 {
+                    // pixel for pixel: the usual smoothing would soften an icon already the right size
+                    GdipSetInterpolationMode(self.g, InterpolationModeNearestNeighbor);
+                    GdipSetPixelOffsetMode(self.g, PixelOffsetModeHalf);
                     GdipDrawImageRectI(self.g, picture as _, x, y, size, size);
+                    GdipSetPixelOffsetMode(self.g, PixelOffsetModeDefault);
+                    GdipSetInterpolationMode(self.g, InterpolationModeDefault);
                     GdipDisposeImage(picture as _);
                 }
                 SelectObject(dc, old);
@@ -540,6 +765,8 @@ struct Gpu {
     vertex: ID3D11VertexShader,
     glass: ID3D11PixelShader,
     words: ID3D11PixelShader,
+    names: ID3D11PixelShader,
+    names_blend: ID3D11BlendState,
     numbers: ID3D11Buffer,
     sampler: ID3D11SamplerState,
     over: ID3D11BlendState,
@@ -581,6 +808,8 @@ struct Engine {
     dpi: f32,
     _gdiplus: usize,
     gpu: Option<Gpu>,
+    panel_text: TextLayer,
+    rail_text: TextLayer,
     open_panel: Option<(Panel, Neck)>,
     waiting_panel: Option<Panel>,
     rail_showing: bool,
@@ -675,7 +904,7 @@ pub unsafe fn start(window: HWND, dpi: f32) -> Result<(), String> {
         }
     };
     LIGHT_WANTED.store(false, Ordering::Relaxed);
-    *ENGINE.lock().unwrap() = Some(Engine { device, context, factory, dcomp, _target: target, rail, panel, neck, rail_rect: (0, 0, 1, 1), panel_size: (0, 0), origin: window_origin(window), dpi, _gdiplus: token, gpu, open_panel: None, waiting_panel: None, rail_showing: false, mouse: (0.0, 0.0, 0.0) });
+    *ENGINE.lock().unwrap() = Some(Engine { device, context, factory, dcomp, _target: target, rail, panel, neck, rail_rect: (0, 0, 1, 1), panel_size: (0, 0), origin: window_origin(window), dpi, _gdiplus: token, gpu, panel_text: TextLayer::default(), rail_text: TextLayer::default(), open_panel: None, waiting_panel: None, rail_showing: false, mouse: (0.0, 0.0, 0.0) });
     Ok(())
 }
 
@@ -718,6 +947,9 @@ unsafe fn make_gpu(device: &ID3D11Device) -> Result<Gpu, String> {
     let vs = compile(source, b"cover_screen\0", b"vs_5_0\0")?;
     let ps = compile(source, b"glass\0", b"ps_5_0\0")?;
     let ws = compile(source, b"words\0", b"ps_5_0\0")?;
+    let ns = compile(source, b"names\0", b"ps_5_0\0")?;
+    let mut names = None;
+    device.CreatePixelShader(&ns, None, Some(&mut names)).map_err(text)?;
     let (mut vertex, mut glass, mut words) = (None, None, None);
     device.CreateVertexShader(&vs, None, Some(&mut vertex)).map_err(text)?;
     device.CreatePixelShader(&ps, None, Some(&mut glass)).map_err(text)?;
@@ -748,6 +980,9 @@ unsafe fn make_gpu(device: &ID3D11Device) -> Result<Gpu, String> {
     };
     let mut over = None;
     device.CreateBlendState(&blend_desc, Some(&mut over)).map_err(text)?;
+    blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC1_COLOR; // each colour keeps its own share of the glass
+    let mut names_blend = None;
+    device.CreateBlendState(&blend_desc, Some(&mut names_blend)).map_err(text)?;
     let mut clip = None;
     let desc = D3D11_RASTERIZER_DESC { FillMode: D3D11_FILL_SOLID, CullMode: D3D11_CULL_NONE, ScissorEnable: true.into(), ..Default::default() };
     device.CreateRasterizerState(&desc, Some(&mut clip)).map_err(text)?;
@@ -756,6 +991,8 @@ unsafe fn make_gpu(device: &ID3D11Device) -> Result<Gpu, String> {
         vertex: vertex.ok_or_else(missing)?,
         glass: glass.ok_or_else(missing)?,
         words: words.ok_or_else(missing)?,
+        names: names.ok_or_else(missing)?,
+        names_blend: names_blend.ok_or_else(missing)?,
         numbers: numbers.ok_or_else(missing)?,
         sampler: sampler.ok_or_else(missing)?,
         over: over.ok_or_else(missing)?,
@@ -956,7 +1193,7 @@ impl Engine {
     }
 
     /// Draw glass shapes, then the words over them, and show the result.
-    unsafe fn render(&mut self, s: &Sprite, shapes: &[(Glass, ComRect)], with_words: bool, x: f32, y: f32) {
+    unsafe fn render(&mut self, s: &Sprite, shapes: &[(Glass, ComRect)], with_words: bool, text: Option<(ID3D11ShaderResourceView, ID3D11ShaderResourceView)>, x: f32, y: f32) {
         let Some(wall) = self.wall() else { return };
         let (Some(gpu), Some(swap), Some(page)) = (self.gpu.as_ref(), &s.swap, &s.page) else { return };
         let Ok(back) = swap.GetBuffer::<ID3D11Texture2D>(0) else { return };
@@ -990,6 +1227,14 @@ impl Engine {
                 c.Draw(3, 0);
             }
         }
+        if let Some((colour, cover)) = text {
+            c.RSSetScissorRects(Some(&[ComRect { left: 0, top: 0, right: page.w, bottom: page.h }]));
+            c.PSSetShader(&gpu.names, None);
+            c.OMSetBlendState(&gpu.names_blend, Some(&[0.0; 4]), 0xFFFF_FFFF);
+            c.PSSetShaderResources(0, Some(&[Some(colour), Some(cover)]));
+            c.Draw(3, 0);
+            c.PSSetShaderResources(1, Some(&[None]));
+        }
         c.OMSetRenderTargets(None, None);
         let _ = swap.Present(0, DXGI_PRESENT(0));
         let _ = s.visual.SetOffsetX2(x);
@@ -1016,13 +1261,17 @@ impl Engine {
         let mut rail = Sprite { visual: self.rail.visual.clone(), swap: self.rail.swap.take(), page: self.rail.page.take(), words: self.rail.words.take() };
         if self.ensure(&mut rail, w + 2 * margin, h + 2 * margin).is_ok() {
             if repaint || rail.words.is_none() {
+                let mut drew = false;
                 if let Some(page) = rail.page.as_mut() {
                     page.clear();
                     GdipTranslateWorldTransform(page.g, margin as f32, margin as f32, MatrixOrderPrepend);
-                    let mut c = PlusCanvas { g: page.g, dpi, alpha: 255, liquid: true };
+                    let everywhere = (0, 0, page.w, page.h);
+                    let text = self.rail_text.begin(page, (margin, margin), everywhere, &mut drew);
+                    let mut c = PlusCanvas { g: page.g, dpi, alpha: 255, liquid: true, text };
                     layers::paint_rail_on(&mut c, dpi, layers::pill_tint());
                 }
                 self.upload_words(&mut rail);
+                self.rail_text.upload(&self.device, &self.context, drew);
             }
             let (left, top) = ((x - margin) as f32, (y - margin) as f32);
             let base = self.base_numbers(left, top);
@@ -1050,7 +1299,8 @@ impl Engine {
                     shapes.push((numbers, ComRect { left: r.left, top: r.top, right: r.right + 2 * margin, bottom: r.bottom + 2 * margin }));
                 }
             }
-            self.render(&rail, &shapes, true, left, top);
+            let text = self.rail_text.views();
+            self.render(&rail, &shapes, true, text, left, top);
         }
         self.rail = rail;
     }
@@ -1082,6 +1332,7 @@ impl Engine {
         if self.ensure(&mut panel, w, h).is_ok() {
             let settings = layers::settings_showing();
             if settings && repaint {
+                let mut drew = false;
                 if let Some(page) = panel.page.as_mut() {
                     page.clear();
                     let (fx, fy) = ((p.x - left) as f32, (p.y - top) as f32);
@@ -1089,10 +1340,13 @@ impl Engine {
                     GdipSetClipPath(page.g, body, CombineModeReplace);
                     GdipDeletePath(body);
                     GdipTranslateWorldTransform(page.g, fx, fy, MatrixOrderPrepend);
-                    let mut c = PlusCanvas { g: page.g, dpi, alpha: 255, liquid: true };
+                    let (ox, oy) = (p.x - left, p.y - top);
+                    let text = self.panel_text.begin(page, (ox, oy), (ox, oy, ox + p.w, oy + p.h), &mut drew);
+                    let mut c = PlusCanvas { g: page.g, dpi, alpha: 255, liquid: true, text };
                     layers::paint_settings_on(&mut c, dpi, layers::pill_tint(), layers::accent());
                 }
                 self.upload_words(&mut panel);
+                self.panel_text.upload(&self.device, &self.context, drew);
             }
             let (lf, tf) = (left as f32, top as f32);
             let base = self.base_numbers(lf, tf);
@@ -1113,7 +1367,8 @@ impl Engine {
                 glow: vivid(layers::accent()),
                 ..base
             };
-            self.render(&panel, &[(numbers, ComRect { left: 0, top: 0, right: w, bottom: h })], settings, lf, tf);
+            let names = if settings { self.panel_text.views() } else { None };
+            self.render(&panel, &[(numbers, ComRect { left: 0, top: 0, right: w, bottom: h })], settings, names, lf, tf);
         }
         self.panel = panel;
     }
@@ -1140,7 +1395,9 @@ impl Engine {
                         }
                     }
                 }
-                let mut c = PlusCanvas { g: page.g, dpi: self.dpi, alpha: if glass { 150 } else { 225 }, liquid: false };
+                let mut drew = false;
+                let text = TextTarget { page: page.pixels.as_mut_ptr(), colour: std::ptr::null_mut(), cover: std::ptr::null_mut(), w: page.w, h: page.h, origin: (0, 0), clip: (0, 0, page.w, page.h), drew: &mut drew };
+                let mut c = PlusCanvas { g: page.g, dpi: self.dpi, alpha: if glass { 150 } else { 225 }, liquid: false, text };
                 layers::paint_rail_on(&mut c, self.dpi, layers::pill_tint());
                 if glass {
                     if let Ok(pills) = layers::PILLS.lock() {
@@ -1169,6 +1426,45 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleartype_blends_each_colour_by_its_own_amount() {
+        // white at full red, half green, no blue over a solid dark pixel
+        let out = lcd_over(0xFF10_1010, 0x00FF_8000, 0xFFFF_FFFF);
+        assert_eq!((out >> 16) & 255, 255);
+        assert_eq!((out >> 8) & 255, (255 * 128 + 16 * 127) / 255);
+        assert_eq!(out & 255, 16);
+        assert_eq!(out >> 24, 255);
+        // a coloured text keeps its colour where fully covered
+        let red = lcd_over(0xFF10_1010, 0x00FF_FFFF, 0xFFC0_2040);
+        assert_eq!(red & 0x00FF_FFFF, 0x00C0_2040);
+        // no cover leaves the pixel alone, even a clear one
+        assert_eq!(lcd_over(0, 0, 0xFFFF_FFFF), 0);
+        assert_eq!(lcd_over(0x8040_2010, 0, 0xFFFF_FFFF), 0x8040_2010);
+    }
+
+    #[test]
+    fn the_card_gets_colour_mixed_with_the_amounts() {
+        assert_eq!(colour_for_card(0x00FF_8000, 0xFFFF_FFFF), 0x00FF_8000);
+        assert_eq!(colour_for_card(0x00FF_FF00, 0xFFC0_2040), 0x00C0_2000);
+    }
+
+    #[test]
+    fn shade_darkens_and_never_lightens() {
+        let out = shade(0xFF80_8080, 128);
+        assert!((out & 255) < 0x80 && out >> 24 == 255);
+        assert_eq!(shade(0, 0), 0);
+        assert_eq!(shade(0, 255) >> 24, 255);
+    }
+
+    #[test]
+    fn long_names_are_cut_to_what_fits() {
+        let short = longest_fit("abc", &mut |t| t.chars().count() <= 5);
+        assert_eq!(short, "abc");
+        let cut = longest_fit("a long file name", &mut |t| t.chars().count() <= 5);
+        assert_eq!(cut, "a lo\u{2026}");
+        assert_eq!(longest_fit("anything", &mut |_| false), "\u{2026}");
+    }
 
     #[test]
     fn blur_keeps_flat_colour_flat_and_softens_a_spike() {
@@ -1337,7 +1633,18 @@ pub unsafe fn set_panel(x: i32, y: i32, w: i32, h: i32, radius: i32) {
             if settings {
                 GdipSetClipPath(g, body, CombineModeReplace);
                 GdipTranslateWorldTransform(g, fx, fy, MatrixOrderPrepend);
-                let mut c = PlusCanvas { g, dpi, alpha: 255, liquid: false };
+                let mut drew = false;
+                let text = TextTarget {
+                    page: page.pixels.as_mut_ptr(),
+                    colour: std::ptr::null_mut(),
+                    cover: std::ptr::null_mut(),
+                    w: page.w,
+                    h: page.h,
+                    origin: (shadow, shadow),
+                    clip: (shadow, shadow, shadow + w, shadow + h),
+                    drew: &mut drew,
+                };
+                let mut c = PlusCanvas { g, dpi, alpha: 255, liquid: false, text };
                 layers::paint_settings_on(&mut c, dpi, pill, accent);
             }
             GdipDeletePath(body);
