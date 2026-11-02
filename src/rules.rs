@@ -28,6 +28,37 @@ pub struct Config {
     pub portals: Vec<(String, String)>,
     /// Draw the icons in the panel and keep Explorer's own icons parked.
     pub own_icons: bool,
+    /// How things look. Each is one of the choices `parse_config` accepts.
+    pub font: String,
+    pub text_size: String,
+    pub icon_size: String,
+    pub icon_tint: String,
+    pub corners: String,
+    pub panel: String,
+    /// Open a section when the mouse rests on its label.
+    pub hover_open: bool,
+    /// A section's own symbol, in place of the usual one.
+    pub symbols: Vec<(String, char)>,
+    /// Each section's order and view, where it is not the usual newest-first grid.
+    pub sort: Vec<(String, String)>,
+    pub view: Vec<(String, String)>,
+    /// Sections that stay open when the empty desktop is clicked.
+    pub pinned: Vec<String>,
+    /// Sections shown as tabs of one panel: (group name, its sections).
+    pub tabs: Vec<(String, Vec<String>)>,
+    /// Chosen colours, in place of the theme's.
+    pub text_colour: Option<u32>,
+    pub border_colour: Option<u32>,
+    pub tint_colour: Option<u32>,
+    pub panel_colour: Option<u32>,
+    /// How solid a panel of files is, percent of normal.
+    pub glass: u32,
+    /// The shortcut shows the sections over open windows instead of clearing them away.
+    pub peek: bool,
+    /// The labels fade while unused.
+    pub fade: bool,
+    /// Keep a separate layout for each arrangement of screens.
+    pub monitor_profiles: bool,
 }
 
 /// A path with each %NAME% replaced by that variable's value. Unknown names stay as written.
@@ -107,6 +138,9 @@ pub fn set_setting(text: &str, part: &str, key: &str, value: &str) -> String {
     lines.join("\n") + "\n"
 }
 
+pub const SORTS: [&str; 5] = ["newest", "oldest", "name", "name_desc", "type"];
+pub const FONTS: [&str; 5] = ["segoe ui", "calibri", "arial", "verdana", "tahoma"];
+
 pub fn parse_config(text: &str) -> Result<Config, String> {
     let mut cfg = Config {
         types: vec![],
@@ -126,6 +160,26 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
         style: "plain".to_string(),
         portals: vec![],
         own_icons: false,
+        font: "segoe ui".to_string(),
+        text_size: "normal".to_string(),
+        icon_size: "medium".to_string(),
+        icon_tint: "off".to_string(),
+        corners: "soft".to_string(),
+        panel: "normal".to_string(),
+        hover_open: false,
+        symbols: vec![],
+        sort: vec![],
+        view: vec![],
+        pinned: vec![],
+        tabs: vec![],
+        text_colour: None,
+        border_colour: None,
+        tint_colour: None,
+        panel_colour: None,
+        glass: 100,
+        peek: false,
+        fade: false,
+        monitor_profiles: false,
     };
     let mut old_pretty = false;
     let mut style_given = false;
@@ -147,6 +201,23 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
             "types" => cfg.types.push((key, value.to_lowercase().split_whitespace().map(String::from).collect())),
             "names" => cfg.names.push((key, value.to_string())),
             "portals" => cfg.portals.push((key, value.to_string())),
+            "sort" => {
+                if !SORTS.contains(&value) {
+                    return Err(format!("sections.ini: sort should be one of {}: {line}", SORTS.join(", ")));
+                }
+                cfg.sort.push((key, value.to_string()));
+            }
+            "view" => {
+                if !matches!(value, "grid" | "list") {
+                    return Err(format!("sections.ini: view should be grid or list: {line}"));
+                }
+                cfg.view.push((key, value.to_string()));
+            }
+            "tabs" => cfg.tabs.push((key, value.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())),
+            "symbols" => {
+                let symbol = u32::from_str_radix(value, 16).ok().and_then(char::from_u32).ok_or_else(|| format!("sections.ini: a symbol is a hex code such as E8B7: {line}"))?;
+                cfg.symbols.push((key, symbol));
+            }
             "layout" => cfg.order.extend(value.split(',').map(|s| s.trim().to_string())),
             "colours" => {
                 let rgb = u32::from_str_radix(value, 16).map_err(|_| format!("sections.ini: not a colour: {line}"))?;
@@ -193,6 +264,41 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
                     "own" => cfg.own_icons = true,
                     _ => return Err(format!("sections.ini: icons should be explorer or own: {line}")),
                 },
+                "hover_open" => cfg.hover_open = on_off(&key, value)?,
+                "peek" => cfg.peek = on_off(&key, value)?,
+                "fade" => cfg.fade = on_off(&key, value)?,
+                "monitor_profiles" => cfg.monitor_profiles = on_off(&key, value)?,
+                "pinned" => cfg.pinned = value.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+                "glass" => {
+                    cfg.glass = value.parse().ok().filter(|v| (20..=160).contains(v)).ok_or_else(|| format!("sections.ini: glass should be 20 to 160: {line}"))?;
+                }
+                "text_colour" | "border_colour" | "tint_colour" | "panel_colour" => {
+                    let rgb = u32::from_str_radix(value, 16).ok().filter(|_| value.len() == 6).ok_or_else(|| format!("sections.ini: not a colour: {line}"))?;
+                    let colour = Some(((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF));
+                    match key.as_str() {
+                        "text_colour" => cfg.text_colour = colour,
+                        "border_colour" => cfg.border_colour = colour,
+                        "tint_colour" => cfg.tint_colour = colour,
+                        _ => cfg.panel_colour = colour,
+                    }
+                }
+                "font" | "text_size" | "icon_size" | "icon_tint" | "corners" | "panel" => {
+                    let (allowed, slot): (&[&str], &mut String) = match key.as_str() {
+                        "font" => (&FONTS, &mut cfg.font),
+                        "text_size" => (&["small", "normal", "large"], &mut cfg.text_size),
+                        "icon_size" => (&["small", "medium", "large"], &mut cfg.icon_size),
+                        "icon_tint" => (&["off", "section", "mono"], &mut cfg.icon_tint),
+                        "corners" => (&["square", "soft", "round"], &mut cfg.corners),
+                        _ => (&["clear", "normal", "solid"], &mut cfg.panel),
+                    };
+                    if !allowed.contains(&value) {
+                        return Err(format!("sections.ini: {key} should be one of {}: {line}", allowed.join(", ")));
+                    }
+                    *slot = value.to_string();
+                    if key == "panel" {
+                        cfg.glass = match value { "clear" => 50, "solid" => 140, _ => 100 };
+                    }
+                }
                 "pretty" => old_pretty = on_off(&key, value)?, // from before there were styles
                 "style" => {
                     if !matches!(value, "plain" | "smooth" | "glass" | "liquid" | "aurora" | "neon") {
@@ -313,11 +419,237 @@ pub fn glob(pattern: &str, name: &str) -> bool {
 }
 
 /// `kind` is "folder", "system", "unknown", or a lower-case extension such as ".docx".
+#[cfg(test)]
 pub fn classify<'a>(name: &str, kind: &str, cfg: &'a Config) -> &'a str {
-    if let Some((_, section)) = cfg.names.iter().find(|(pattern, _)| glob(pattern, name)) {
+    classify_with(name, kind, 0, 0, cfg)
+}
+
+/// A number with a size or time ending, as a rule writes it: 100mb, 2gb, 7d.
+fn rule_number(text: &str, units: &[(&str, u64)]) -> Option<u64> {
+    let text = text.trim().to_lowercase();
+    units.iter().find_map(|(end, by)| text.strip_suffix(end).and_then(|n| n.trim().parse::<u64>().ok()).map(|n| n * by))
+}
+
+const SIZES: [(&str, u64); 5] = [("kb", 1 << 10), ("mb", 1 << 20), ("gb", 1 << 30), ("tb", 1 << 40), ("b", 1)];
+const AGES: [(&str, u64); 3] = [("d", 1), ("w", 7), ("y", 365)];
+
+/// If a rule's pattern is a condition on size or age, whether it holds: size>100mb, age<7d.
+fn condition(pattern: &str, size: u64, age_days: u64) -> Option<bool> {
+    let p = pattern.trim().to_lowercase();
+    let (have, rest, units): (u64, &str, &[(&str, u64)]) = if let Some(r) = p.strip_prefix("size") { (size, r, &SIZES) } else { (age_days, p.strip_prefix("age")?, &AGES) };
+    if let Some(n) = rest.strip_prefix('>') {
+        return rule_number(n, units).map(|n| have > n);
+    }
+    rest.strip_prefix('<').and_then(|n| rule_number(n, units)).map(|n| have < n)
+}
+
+/// Whether a name rule's pattern is a working pattern: conditions must read properly.
+pub fn valid_pattern(pattern: &str) -> bool {
+    let p = pattern.trim().to_lowercase();
+    if p.is_empty() {
+        return false;
+    }
+    let looks_like_condition = (p.starts_with("size") || p.starts_with("age")) && (p.contains('>') || p.contains('<'));
+    !looks_like_condition || condition(&p, 0, 0).is_some()
+}
+
+/// Which section an item goes to. Rules are tried in the order written, and the first that fits wins.
+pub fn classify_with<'a>(name: &str, kind: &str, size: u64, age_days: u64, cfg: &'a Config) -> &'a str {
+    let fits = |pattern: &str| condition(pattern, size, age_days).unwrap_or_else(|| glob(pattern, name));
+    if let Some((_, section)) = cfg.names.iter().find(|(pattern, _)| fits(pattern)) {
         return section;
     }
     cfg.types.iter().find(|(_, tokens)| tokens.iter().any(|t| t == kind)).map_or("Other", |(s, _)| s)
+}
+
+// ---------- changing the rules file from Settings
+
+/// Rewrite the `key = value` lines of one part. `change` gives the new line, or None to drop it.
+fn map_part(text: &str, part: &str, change: &mut dyn FnMut(&str, &str) -> Option<String>) -> String {
+    let header = format!("[{part}]");
+    let mut inside = false;
+    let mut out = vec![];
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            inside = trimmed == header;
+        } else if inside && !trimmed.starts_with('#') && !trimmed.starts_with(';') {
+            if let Some((key, value)) = trimmed.rsplit_once('=') {
+                if let Some(new) = change(key.trim(), value.trim()) {
+                    out.push(new);
+                }
+                continue;
+            }
+        }
+        out.push(line.to_string());
+    }
+    out.join("\n") + "\n"
+}
+
+pub fn remove_setting(text: &str, part: &str, key: &str) -> String {
+    map_part(text, part, &mut |k, v| (k != key).then(|| format!("{k} = {v}")))
+}
+
+/// A list of names with one changed or, given None, taken out.
+fn swap_in_list(list: &str, old: &str, new: Option<&str>) -> String {
+    list.split(',').map(str::trim).filter(|s| !s.is_empty()).filter_map(|s| if s == old { new } else { Some(s) }).collect::<Vec<_>>().join(", ")
+}
+
+/// Go through everywhere a section is named. `new` None means it is being removed.
+fn change_section(text: &str, old: &str, new: Option<&str>) -> String {
+    let mut text = text.to_string();
+    for part in ["types", "colours", "symbols", "portals", "sort", "view"] {
+        text = map_part(&text, part, &mut |k, v| if k == old { new.map(|n| format!("{n} = {v}")) } else { Some(format!("{k} = {v}")) });
+    }
+    text = map_part(&text, "names", &mut |k, v| if v == old { new.map(|n| format!("{k} = {n}")) } else { Some(format!("{k} = {v}")) });
+    text = map_part(&text, "layout", &mut |k, v| {
+        let list = swap_in_list(v, old, new);
+        (!list.is_empty()).then(|| format!("{k} = {list}"))
+    });
+    text = map_part(&text, "tabs", &mut |k, v| {
+        let list = swap_in_list(v, old, new);
+        // one section alone is not a set of tabs
+        list.contains(',').then(|| format!("{k} = {list}"))
+    });
+    map_part(&text, "general", &mut |k, v| Some(if k == "pinned" { format!("{k} = {}", swap_in_list(v, old, new)) } else { format!("{k} = {v}") }))
+}
+
+pub fn rename_section(text: &str, old: &str, new: &str) -> String {
+    change_section(text, old, Some(new))
+}
+
+/// Remove a section. Its files go where the other rules send them, or to Other. Nothing moves on disk.
+pub fn remove_section(text: &str, name: &str) -> String {
+    change_section(text, name, None)
+}
+
+pub fn add_section(text: &str, name: &str) -> String {
+    let text = set_setting(text, "types", name, "");
+    let order = section_order(&text);
+    let mut order = order;
+    order.push(name.to_string());
+    set_order(&text, &order)
+}
+
+pub fn add_portal(text: &str, name: &str, folder: &str) -> String {
+    set_setting(text, "portals", name, folder)
+}
+
+fn section_order(text: &str) -> Vec<String> {
+    let mut found = vec![];
+    map_part(text, "layout", &mut |k, v| {
+        found.extend(v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from));
+        Some(format!("{k} = {v}"))
+    });
+    found
+}
+
+fn set_order(text: &str, order: &[String]) -> String {
+    let mut first = true;
+    let list = order.join(", ");
+    map_part(text, "layout", &mut |k, _| {
+        let keep = first;
+        first = false;
+        keep.then(|| format!("{k} = {list}"))
+    })
+}
+
+/// Move a section up (-1) or down (1) the rail.
+pub fn move_section(text: &str, name: &str, by: i32) -> String {
+    let mut order = section_order(text);
+    let Some(at) = order.iter().position(|s| s == name) else { return text.to_string() };
+    let to = at as i32 + by;
+    if to < 0 || to >= order.len() as i32 {
+        return text.to_string();
+    }
+    order.swap(at, to as usize);
+    set_order(text, &order)
+}
+
+/// Put a section into tabs with the one above it on the rail, or take it out of its tabs.
+pub fn toggle_tab(text: &str, name: &str) -> String {
+    let mut in_group = false;
+    let taken = map_part(text, "tabs", &mut |k, v| {
+        let had = v.split(',').any(|s| s.trim() == name);
+        in_group |= had;
+        let list = swap_in_list(v, name, None);
+        list.contains(',').then(|| format!("{k} = {list}"))
+    });
+    if in_group {
+        return taken;
+    }
+    let order = section_order(text);
+    let Some(at) = order.iter().position(|s| s == name).filter(|at| *at > 0) else { return text.to_string() };
+    let above = &order[at - 1];
+    let mut joined = false;
+    let grown = map_part(text, "tabs", &mut |k, v| {
+        if v.split(',').any(|s| s.trim() == above) {
+            joined = true;
+            Some(format!("{k} = {v}, {name}"))
+        } else {
+            Some(format!("{k} = {v}"))
+        }
+    });
+    if joined {
+        return grown;
+    }
+    set_setting(text, "tabs", above, &format!("{above}, {name}"))
+}
+
+/// A name for a section is on one line, and cannot upset the rules file or take a reserved word.
+pub fn valid_section_name(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty() && name.len() <= 40 && !name.contains(['=', ',', '[', ']', '#', ';', '\n']) && name != RECENT && name != "Settings" && name != "Find"
+}
+
+// ---------- sorting and details
+
+/// Sort (time, name, kind, index) as this section asks. Newest first is the usual way.
+pub fn sort_entries<T>(entries: &mut [(u64, String, String, T)], how: &str) {
+    match how {
+        "oldest" => entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1))),
+        "name" => entries.sort_by(|a, b| a.1.cmp(&b.1)),
+        "name_desc" => entries.sort_by(|a, b| b.1.cmp(&a.1)),
+        "type" => entries.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1))),
+        _ => entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))),
+    }
+}
+
+/// The next way of sorting, for the button that goes through them.
+pub fn next_sort(how: &str) -> &'static str {
+    let at = SORTS.iter().position(|s| *s == how).unwrap_or(0);
+    SORTS[(at + 1) % SORTS.len()]
+}
+
+pub fn sort_label(how: &str) -> &'static str {
+    match how {
+        "oldest" => "Oldest",
+        "name" => "A to Z",
+        "name_desc" => "Z to A",
+        "type" => "Type",
+        _ => "Newest",
+    }
+}
+
+pub fn human_size(bytes: u64) -> String {
+    match bytes {
+        b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
+        b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
+        b if b >= 1 << 10 => format!("{} KB", b >> 10),
+        b => format!("{b} B"),
+    }
+}
+
+/// Seconds since 1970 as year-month-day, by the usual civil calendar sum.
+pub fn human_date(seconds: u64) -> String {
+    let z = (seconds / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let (d, m) = (doy - (153 * mp + 2) / 5 + 1, if mp < 10 { mp + 3 } else { mp - 9 });
+    format!("{:04}-{m:02}-{d:02}", yoe + era * 400 + i64::from(m <= 2))
 }
 
 /// Which items belong in Recent: newest first, shortcuts and system icons left out.
@@ -486,6 +818,113 @@ mod tests {
         assert_eq!(with("style = liquid"), "liquid");
         assert_eq!(with("style = aurora"), "aurora");
         assert_eq!(with("style = neon"), "neon");
+    }
+
+    const EDITABLE: &str = "[general]\npinned = Word, PDF\n[types]\nWord = .docx\nPDF = .pdf\nNotes = .txt\nOther =\n[names]\n*x* = Word\n[layout]\ncolumn1 = Word, PDF\ncolumn2 = Notes, Other\n[colours]\nWord = 112233\n[tabs]\nDocs = Word, PDF\n";
+
+    #[test]
+    fn renaming_a_section_reaches_everywhere_it_is_named() {
+        let text = rename_section(EDITABLE, "Word", "Letters");
+        let cfg = parse_config(&text).unwrap();
+        assert!(!text.contains("Word"), "{text}");
+        assert!(cfg.order.contains(&"Letters".to_string()));
+        assert_eq!(cfg.names[0].1, "Letters");
+        assert_eq!(cfg.pinned, vec!["Letters".to_string(), "PDF".to_string()]);
+        assert_eq!(cfg.tabs[0].1, vec!["Letters".to_string(), "PDF".to_string()]);
+    }
+
+    #[test]
+    fn removing_a_section_leaves_a_file_that_loads() {
+        let text = remove_section(EDITABLE, "Word");
+        let cfg = parse_config(&text).unwrap();
+        assert!(!text.contains("Word"), "{text}");
+        assert_eq!(cfg.order, vec!["PDF", "Notes", "Other"]);
+        assert!(cfg.names.is_empty());
+        assert!(cfg.tabs.is_empty()); // one section alone is not a set of tabs
+        assert_eq!(classify("a.docx", ".docx", &cfg), "Other");
+    }
+
+    #[test]
+    fn sections_can_be_added_and_moved() {
+        let text = add_section(EDITABLE, "Photos");
+        let cfg = parse_config(&text).unwrap();
+        assert_eq!(cfg.order.last().unwrap(), "Photos");
+        let up = parse_config(&move_section(EDITABLE, "PDF", -1)).unwrap();
+        assert_eq!(up.order, vec!["PDF", "Word", "Notes", "Other"]);
+        let down = parse_config(&move_section(EDITABLE, "PDF", 1)).unwrap();
+        assert_eq!(down.order, vec!["Word", "Notes", "PDF", "Other"]);
+        assert_eq!(move_section(EDITABLE, "Word", -1), EDITABLE); // already at the top
+    }
+
+    #[test]
+    fn tabs_join_the_section_above_and_can_be_left() {
+        let joined = parse_config(&toggle_tab(EDITABLE, "Notes")).unwrap();
+        assert_eq!(joined.tabs[0].1, vec!["Word", "PDF", "Notes"]);
+        let left = parse_config(&toggle_tab(EDITABLE, "PDF")).unwrap();
+        assert!(left.tabs.is_empty());
+        let fresh = "[types]\nA = .a\nB = .b\nOther =\n[layout]\ncolumn1 = A, B, Other\n";
+        assert_eq!(parse_config(&toggle_tab(fresh, "B")).unwrap().tabs[0].1, vec!["A", "B"]);
+        assert_eq!(toggle_tab(fresh, "A"), fresh); // nothing above it
+    }
+
+    #[test]
+    fn rules_can_ask_about_size_and_age_and_the_first_that_fits_wins() {
+        let cfg = parse_config("[types]\nBig = .x\nOld = .y\nNew = .z\nOther =\n[names]\nsize>100mb = Big\nage>30d = Old\nage<2w = New\n[layout]\ncolumn1 = Big, Old, New, Other\n").unwrap();
+        assert_eq!(classify_with("a", ".q", 200 << 20, 400, &cfg), "Big");
+        assert_eq!(classify_with("a", ".q", 1, 400, &cfg), "Old");
+        assert_eq!(classify_with("a", ".q", 1, 3, &cfg), "New");
+        assert_eq!(classify_with("a", ".q", 1, 20, &cfg), "Other");
+        assert!(valid_pattern("size>1gb") && valid_pattern("age<7d") && valid_pattern("*.pdf"));
+        assert!(!valid_pattern("size>big") && !valid_pattern("age<") && !valid_pattern(""));
+    }
+
+    #[test]
+    fn section_names_cannot_break_the_file() {
+        assert!(valid_section_name("My papers"));
+        for bad in ["", "  ", "a=b", "a,b", "[a]", "Recent", "Settings", "Find", "#a"] {
+            assert!(!valid_section_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn entries_sort_as_asked() {
+        let make = || vec![(2u64, "b".to_string(), ".x".to_string(), 0), (3, "a".to_string(), ".y".to_string(), 1), (1, "c".to_string(), ".a".to_string(), 2)];
+        for (how, want) in [("newest", [1, 0, 2]), ("oldest", [2, 0, 1]), ("name", [1, 0, 2]), ("name_desc", [2, 0, 1]), ("type", [2, 0, 1])] {
+            let mut e = make();
+            sort_entries(&mut e, how);
+            assert_eq!(e.iter().map(|x| x.3).collect::<Vec<_>>(), want, "{how}");
+        }
+        assert_eq!(next_sort("newest"), "oldest");
+        assert_eq!(next_sort("type"), "newest");
+    }
+
+    #[test]
+    fn sizes_and_dates_read_well() {
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(2048), "2 KB");
+        assert_eq!(human_size(3 << 20), "3.0 MB");
+        assert_eq!(human_date(0), "1970-01-01");
+        assert_eq!(human_date(1_793_600_000), "2026-11-02");
+    }
+
+    #[test]
+    fn the_look_has_plain_defaults_and_refuses_nonsense() {
+        let with = |extra: &str| parse_config(&format!("[types]\nOther =\n[layout]\ncolumn1 = Other\n[general]\n{extra}\n"));
+        let plain = with("").unwrap();
+        assert_eq!((plain.font.as_str(), plain.icon_size.as_str(), plain.icon_tint.as_str(), plain.hover_open), ("segoe ui", "medium", "off", false));
+        assert_eq!(with("icon_tint = mono").unwrap().icon_tint, "mono");
+        assert_eq!(with("font = arial").unwrap().font, "arial");
+        assert!(with("hover_open = on").unwrap().hover_open);
+        for bad in ["icon_size = huge", "font = wingdings", "corners = wavy", "panel = glass", "text_size = 9"] {
+            assert!(with(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_section_can_have_its_own_symbol() {
+        let cfg = parse_config("[types]\nOther =\n[layout]\ncolumn1 = Other\n[symbols]\nOther = E8B7\n").unwrap();
+        assert_eq!(cfg.symbols, vec![("Other".to_string(), '\u{E8B7}')]);
+        assert!(parse_config("[types]\nOther =\n[layout]\ncolumn1 = Other\n[symbols]\nOther = star\n").is_err());
     }
 
     #[test]

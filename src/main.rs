@@ -64,6 +64,11 @@ const WM_STOP: u32 = WM_APP + 2;
 const WM_REMAKE: u32 = WM_APP + 3;
 const WM_MENU: u32 = WM_APP + 4;
 const WM_TAKE_KEYS: u32 = WM_APP + 5;
+const HOTKEY_FIND: usize = 2;
+const HOTKEY_NEXT: usize = 3;
+const HOTKEY_PREVIOUS: usize = 4;
+/// The section that lists what is being typed to find.
+const FIND: &str = "Find";
 const WM_GIVE_BACK_KEYS: u32 = WM_APP + 6;
 const SPI_SETWORKAREA_CHANGE: usize = 47;
 const EVENT_OBJECT_CREATE: u32 = 0x8000;
@@ -103,6 +108,37 @@ fn state_dir() -> PathBuf {
 fn rules_file() -> PathBuf {
     home().join("sections.ini")
 }
+fn layouts_dir() -> PathBuf {
+    state_dir().join("layouts")
+}
+
+fn layout_file(name: &str) -> PathBuf {
+    layouts_dir().join(format!("{name}.ini"))
+}
+
+fn current_layout_file() -> PathBuf {
+    state_dir().join("current_layout.txt")
+}
+
+fn profiles_dir() -> PathBuf {
+    state_dir().join("screen_profiles")
+}
+
+/// The saved layouts, by name.
+fn layout_names() -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(layouts_dir()).into_iter().flatten().flatten().filter_map(|e| {
+        let p = e.path();
+        (p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ini"))).then(|| p.file_stem().map(|s| s.to_string_lossy().into_owned())).flatten()
+    }).collect();
+    names.sort();
+    names
+}
+
+/// The arrangement of screens, as a name fit for a file.
+unsafe fn screens_name() -> String {
+    screens().iter().map(|s| format!("{}x{}", s.rcMonitor.right - s.rcMonitor.left, s.rcMonitor.bottom - s.rcMonitor.top)).collect::<Vec<_>>().join("_")
+}
+
 fn open_file() -> PathBuf {
     state_dir().join("open.txt")
 }
@@ -432,9 +468,11 @@ struct Portal {
 
 /// A folder's visible files, newest first. A folder on a sleeping network drive could hold up this
 /// read, which runs on the worker. ponytail: read it on its own thread if anyone hits that.
-fn read_portal(folder: PathBuf) -> Option<Portal> {
+fn read_portal(folder: PathBuf, sort: &str) -> Option<Portal> {
     use std::os::windows::fs::MetadataExt;
     const HIDDEN_OR_SYSTEM: u32 = 2 | 4;
+    /// A folder bigger than this is not browsed from the desktop; the Open folder button still works.
+    const MOST: usize = 5000;
     let mut found = vec![];
     for entry in std::fs::read_dir(&folder).ok()?.flatten() {
         let Ok(meta) = entry.metadata() else { continue };
@@ -442,32 +480,32 @@ fn read_portal(folder: PathBuf) -> Option<Portal> {
             continue;
         }
         let secs = |t: std::io::Result<std::time::SystemTime>| t.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
-        found.push((secs(meta.modified()).max(secs(meta.created())), entry.path(), entry.file_name().to_string_lossy().into_owned()));
+        let path = entry.path();
+        let kind = if meta.is_dir() { String::new() } else { path.extension().map_or(String::new(), |e| e.to_string_lossy().to_lowercase()) };
+        found.push((secs(meta.modified()).max(secs(meta.created())), entry.file_name().to_string_lossy().into_owned(), kind, path));
     }
     let total = found.len();
-    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.cmp(&b.2)));
-    found.truncate(settings::PORTAL_SHOWN);
-    Some(Portal { folder, files: found.into_iter().map(|(_, path, name)| (path, name)).collect(), total })
+    sort_entries(&mut found, sort);
+    found.truncate(MOST);
+    Some(Portal { folder, files: found.into_iter().map(|(_, name, _, path)| (path, name)).collect(), total })
 }
 
-/// The icon Windows shows for this file. ponytail: kept for the program's life, as there are few;
-/// free the oldest if a busy folder ever makes this matter.
 /// A file's icon, made again if the file has changed since, so a thumbnail is never out of date.
-unsafe fn cached_icon(icons: &mut HashMap<PathBuf, (u64, isize)>, path: &Path, dpi: f32) -> isize {
-    let changed = stamp(path);
+unsafe fn cached_icon(icons: &mut HashMap<PathBuf, (u64, isize)>, path: &Path, side: i32) -> isize {
+    let changed = stamp(path) ^ ((side as u64) << 52); // a new icon size is a change too
     if let Some(&(when, icon)) = icons.get(path) {
         if when == changed {
             return icon;
         }
         DestroyIcon(icon as HICON);
     }
-    let icon = file_icon(path, dpi);
+    let icon = file_icon(path, side);
     icons.insert(path.to_path_buf(), (changed, icon));
     icon
 }
 
-unsafe fn file_icon(path: &Path, dpi: f32) -> isize {
-    let sharp = shellmenu::sharp_icon(path, settings::icon_pixels(dpi)); // the size the panel draws it, so nothing is stretched
+unsafe fn file_icon(path: &Path, side: i32) -> isize {
+    let sharp = shellmenu::sharp_icon(path, side); // the size the panel draws it, so nothing is stretched
     if sharp != 0 {
         return sharp;
     }
@@ -543,18 +581,59 @@ impl Plan {
         (self.room.0 - (m.gap + m.rail_w + m.bridge) - m.gap - 2 * m.pad, self.room.1 - 2 * m.gap - 2 * m.pad)
     }
 
+    /// Whether Rivulet draws this section's files itself, with a header and scrolling.
+    fn draws_files(&self, section: &str) -> bool {
+        section != SETTINGS && (self.cfg.own_icons || self.portals.contains_key(section))
+    }
+
+    fn tabs_of(&self, section: &str) -> Option<&Vec<String>> {
+        self.cfg.tabs.iter().map(|(_, list)| list).find(|list| list.iter().any(|s| s == section))
+    }
+
+    fn files_in(&self, at: usize) -> i32 {
+        let name = &self.groups[at].0;
+        self.portals.get(name).map_or(self.groups[at].1.len(), |p| p.files.len()) as i32
+    }
+
+    fn is_list(&self, section: &str) -> bool {
+        self.cfg.view.iter().any(|(s, v)| s == section && v == "list")
+    }
+
+    /// How a panel that draws its own files is laid out: the header's height and the grid.
+    fn file_layout(&self, at: usize) -> Option<(i32, settings::Grid)> {
+        let m = self.m;
+        let name = &self.groups[at].0;
+        let header = settings::header_height(settings::header_rows(self.tabs_of(name).is_some(), self.portals.contains_key(name)), m.dpi);
+        let (room_w, room_h) = self.panel_room();
+        let room_h = room_h - header;
+        let n = self.files_in(at).max(1);
+        if self.is_list(name) {
+            let row = settings::list_row(m.dpi);
+            let most = (room_h / row).max(1);
+            let w = (m.cell_w * 5).min(room_w).max(1);
+            return Some((header, settings::Grid { across: 1, cell: (w, row), pad: m.pad, top: header + m.pad, scroll: 0, visible_rows: n.min(most), list: true }));
+        }
+        let (most_across, most_rows) = ((room_w / m.cell_w).max(1), (room_h / m.cell_h).max(1));
+        let (across, rows) = panel_grid(n, m.cell_w, m.cell_h, room_w, room_h).unwrap_or_else(|| {
+            let across = most_across;
+            (across, (n + across - 1) / across)
+        });
+        let across = across.max(3).min(most_across);
+        let rows = ((n + across - 1) / across).max(rows.min(1));
+        Some((header, settings::Grid { across, cell: (m.cell_w, m.cell_h), pad: m.pad, top: header + m.pad, scroll: 0, visible_rows: rows.min(most_rows), list: false }))
+    }
+
     /// The open panel, level with its label where it fits, and how many icons fit across it.
     fn panel(&self, at: usize) -> Option<(Rect, i32)> {
         let m = self.m;
         let (room_w, room_h) = self.panel_room();
-        let (across, w, h) = if self.groups[at].0 == SETTINGS {
-            let (w, h) = settings::size(m.dpi);
+        let name = &self.groups[at].0;
+        let (across, w, h) = if name == SETTINGS {
+            let (w, h) = settings::size(&self.cfg, m.dpi);
             (1, w, h)
-        } else if let Some(portal) = self.portals.get(&self.groups[at].0) {
-            let header = settings::portal_header(m.dpi);
-            let (across, rows) = panel_grid((portal.files.len() as i32).max(1), m.cell_w, m.cell_h, room_w, room_h - header)?;
-            let across = across.max(3); // room for the title and the button
-            (across, across * m.cell_w + 2 * m.pad, header + rows * m.cell_h + 2 * m.pad)
+        } else if self.draws_files(name) {
+            let (header, g) = self.file_layout(at)?;
+            (g.across, g.across * g.cell.0 + 2 * m.pad, header + g.visible_rows * g.cell.1 + 2 * m.pad)
         } else {
             let (across, rows) = panel_grid(self.groups[at].1.len() as i32, m.cell_w, m.cell_h, room_w, room_h)?;
             (across, across * m.cell_w + 2 * m.pad, rows * m.cell_h + 2 * m.pad)
@@ -606,6 +685,7 @@ unsafe fn chosen_work_area(wanted: usize) -> RECT {
 }
 
 unsafe fn make_plan(desk: &Desktop, cfg: &Config) -> Result<Plan, String> {
+    layers::apply_look(cfg);
     if GetWindowLongPtrW(desk.lv, GWL_STYLE) as i32 & LVS_AUTOARRANGE != 0 {
         return Err("Icons cannot be placed while \"Auto arrange icons\" is on.\n\
                     Right-click the desktop > View > untick Auto arrange icons, then run this again."
@@ -614,8 +694,12 @@ unsafe fn make_plan(desk: &Desktop, cfg: &Config) -> Result<Plan, String> {
     let labels: Vec<String> = (0..desk.count()).map(|i| desk.text(i)).collect();
     let (details, unclear, paths) = describe(&labels);
     let mut sortable: HashMap<&str, Vec<(std::cmp::Reverse<u64>, String, usize)>> = HashMap::new();
+    let wants_size = cfg.names.iter().any(|(p, _)| p.to_lowercase().starts_with("size"));
+    let today = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     for (i, (label, (kind, time))) in labels.iter().zip(&details).enumerate() {
-        sortable.entry(classify(label, kind, cfg)).or_default().push((std::cmp::Reverse(*time), label.to_lowercase(), i));
+        let size = if wants_size { paths.get(i).and_then(|p| p.as_ref()).and_then(|p| p.metadata().ok()).map_or(0, |m| m.len()) } else { 0 };
+        let age = today.saturating_sub(*time) / 86_400;
+        sortable.entry(classify_with(label, kind, size, age, cfg)).or_default().push((std::cmp::Reverse(*time), label.to_lowercase(), i));
     }
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let flat: Vec<(&str, u64, usize)> = details.iter().enumerate().map(|(i, (k, t))| (k.as_str(), *t, i)).collect();
@@ -627,14 +711,17 @@ unsafe fn make_plan(desk: &Desktop, cfg: &Config) -> Result<Plan, String> {
     }
     for section in &cfg.order {
         if let Some(mut items) = sortable.remove(section.as_str()) {
-            items.sort(); // newest first
-            groups.push((section.clone(), items.into_iter().map(|x| x.2).collect::<Vec<_>>()));
+            let how = cfg.sort.iter().find(|(s, _)| s == section).map_or("newest", |(_, h)| h.as_str());
+            let mut entries: Vec<(u64, String, String, usize)> = items.drain(..).map(|(t, name, i)| (t.0, name, details[i].0.clone(), i)).collect();
+            sort_entries(&mut entries, how);
+            groups.push((section.clone(), entries.into_iter().map(|x| x.3).collect::<Vec<_>>()));
         }
     }
     let mut portals = HashMap::new();
     for (name, folder) in &cfg.portals {
         // a folder that is missing, such as an unplugged drive, just shows no label for now
-        if let Some(portal) = read_portal(PathBuf::from(expand_variables(folder, |n| std::env::var(n).ok()))) {
+        let how = cfg.sort.iter().find(|(s, _)| s == name).map_or("newest", |(_, h)| h.as_str());
+        if let Some(portal) = read_portal(PathBuf::from(expand_variables(folder, |n| std::env::var(n).ok())), how) {
             groups.push((name.clone(), vec![]));
             portals.insert(name.clone(), portal);
         }
@@ -648,11 +735,13 @@ unsafe fn make_plan(desk: &Desktop, cfg: &Config) -> Result<Plan, String> {
     let (_, spacing_h) = desk.spacing();
     let scaled = |v: f32| (v * dpi) as i32;
     let room = (work.right - work.left, work.bottom - work.top);
+    // a big icon or big text needs a taller cell than Windows' own spacing gives
+    let own_cell_h = if cfg.own_icons { settings::icon_pixels(dpi) + scaled(16.0) + 2 * layers::name_line(dpi) } else { 0 };
     let wide_spacing = scaled(120.0); // wider than Windows' default, so more of each name shows
     for tighten in [1.0f32, 0.95, 0.9, 0.85, 0.8] {
         let m = Metrics {
             cell_w: (wide_spacing as f32 * tighten) as i32,
-            cell_h: (spacing_h as f32 * tighten) as i32,
+            cell_h: (own_cell_h.max(spacing_h) as f32 * tighten) as i32,
             wide_spacing,
             pad: scaled(6.0),
             gap: scaled(10.0),
@@ -660,7 +749,7 @@ unsafe fn make_plan(desk: &Desktop, cfg: &Config) -> Result<Plan, String> {
             pill_gap: scaled(4.0),
             rail_w: scaled(168.0),
             bridge: scaled(76.0),
-            radius: scaled(14.0),
+            radius: scaled(match cfg.corners.as_str() { "square" => 3.0, "round" => 26.0, _ => 14.0 }),
             dpi,
         };
         let plan = Plan {
@@ -679,7 +768,8 @@ unsafe fn make_plan(desk: &Desktop, cfg: &Config) -> Result<Plan, String> {
             paths: vec![],
         };
         let (room_w, room_h) = plan.panel_room();
-        if groups.iter().all(|(_, g)| panel_grid(g.len() as i32, m.cell_w, m.cell_h, room_w, room_h).is_some()) {
+        // Rivulet's own icons scroll; Explorer's have to fit on the screen
+        if cfg.own_icons || groups.iter().all(|(_, g)| panel_grid(g.len() as i32, m.cell_w, m.cell_h, room_w, room_h).is_some()) {
             return Ok(Plan { labels, groups, unclear, portals, paths, ..plan });
         }
     }
@@ -700,6 +790,15 @@ static COMMANDS: OnceLock<Sender<Command>> = OnceLock::new();
 static CHANGE_WAITING: AtomicBool = AtomicBool::new(false);
 static ICON_LIST: AtomicUsize = AtomicUsize::new(0);
 
+/// What a question put to the user was for.
+pub enum Ask {
+    RenameSection(String),
+    AddSection,
+    AddRule,
+    SaveLayout,
+    NamePortal(String),
+}
+
 enum Command {
     Toggle(String),
     Close,
@@ -711,6 +810,16 @@ enum Command {
     FiledItems(Vec<String>, String),
     /// The button came up on a file without a drag.
     FileRelease(POINT),
+    HoverOpen(String),
+    HoverClose,
+    Scroll(i32),
+    Answered(Ask, String),
+    ColourChosen(String, String),
+    FolderChosen(String),
+    Find,
+    Workspace(i32),
+    FadeIn,
+    PeekOff,
     SelectBox,
     Key(u32, bool, bool),
     ToggleRail(POINT),
@@ -746,6 +855,16 @@ struct Sections {
     selected: Vec<PathBuf>,
     /// Where a Shift press measures from.
     anchor: i32,
+    /// How many rows each section is scrolled.
+    scroll: HashMap<String, i32>,
+    /// Where each portal has been navigated to, oldest first; empty means its own folder.
+    nav: HashMap<String, Vec<PathBuf>>,
+    /// What is being typed to find, and the section to go back to.
+    query: String,
+    find_from: Option<String>,
+    screens_seen: String,
+    last_near: Instant,
+    faded: bool,
 }
 
 unsafe fn load_plan(desk: &Desktop) -> Result<Plan, String> {
@@ -802,7 +921,7 @@ impl Sections {
                 hover: self.hover.as_deref() == Some(name.as_str()),
                 fresh,
                 colour: plan.colour(name),
-                glyph: glyph(name),
+                glyph: plan.cfg.symbols.iter().find(|(s, _)| s == name).map_or_else(|| glyph(name), |(_, c)| *c),
                 rect,
             });
             let screen = RECT { left: sx + rail_x, top: sy + m.gap + top, right: sx + rail_x + m.rail_w, bottom: sy + m.gap + top + m.pill_h };
@@ -855,8 +974,8 @@ impl Sections {
         }
     }
 
-    fn apply_theme(&mut self, theme: &str, style: &str) {
-        let now = format!("{theme}|{style}|{}|{}", wallpaper::current(), wallpaper::placement_setting());
+    fn apply_theme(&mut self, theme: &str, style: &str, tag: &str, panel: Option<u32>) {
+        let now = format!("{theme}|{style}|{tag}|{}|{}", wallpaper::current(), wallpaper::placement_setting());
         if now != self.tinted_for {
             self.apply_style(style);
             if let Some((pill, panel)) = theme_tints(theme) {
@@ -864,41 +983,224 @@ impl Sections {
             } else if let Some(average) = wallpaper::average_colour() {
                 layers::set_tints(dark_shade(average, 46.0), dark_shade(average, 24.0));
             }
+            if let Some(chosen) = panel {
+                layers::set_tints(layers::pill_tint(), chosen);
+            }
             self.tinted_for = now;
         }
     }
 
+    /// A panel of files: its header, and its cells with icons only for what shows, so a big folder
+    /// costs nothing for the files never scrolled to.
+    unsafe fn file_panel(&mut self, plan: &Plan, at: usize, name: &str, mut grid: settings::Grid) -> Vec<settings::Item> {
+        let m = plan.m;
+        let side = if grid.list { settings::list_icon_pixels(m.dpi) } else { settings::icon_pixels(m.dpi) };
+        let mut entries: Vec<(Option<PathBuf>, String)> = match plan.portals.get(name) {
+            Some(portal) => portal.files.iter().map(|(p, f)| (Some(p.clone()), f.clone())).collect(),
+            None => plan.groups[at].1.iter().map(|&i| (plan.paths.get(i).cloned().flatten(), plan.labels[i].clone())).collect(),
+        };
+        let rows = (entries.len() as i32 + grid.across - 1) / grid.across.max(1);
+        let most = (rows - grid.visible_rows).max(0);
+        let scroll = self.scroll.get(name).copied().unwrap_or(0).clamp(0, most);
+        self.scroll.insert(name.to_string(), scroll);
+        grid.scroll = scroll;
+        let first_shown = (scroll * grid.across) as usize;
+        let last_shown = ((scroll + grid.visible_rows) * grid.across) as usize;
+        let files: Vec<_> = entries
+            .drain(..)
+            .enumerate()
+            .map(|(n, (path, file))| {
+                let shows = n >= first_shown && n < last_shown;
+                let icon = match (&path, shows) {
+                    (Some(p), true) => cached_icon(&mut self.icons, p, side),
+                    _ => 0,
+                };
+                let detail = match (&path, shows && grid.list) {
+                    (Some(p), true) => p.metadata().map_or(String::new(), |meta| {
+                        let date = human_date(stamp(p));
+                        if meta.is_dir() { date } else { format!("{date}   {}", human_size(meta.len())) }
+                    }),
+                    _ => String::new(),
+                };
+                (path, file, icon, detail)
+            })
+            .collect();
+        let stack = self.nav.get(name);
+        let title = if name == FIND {
+            if self.query.is_empty() { "Type to find a file".to_string() } else { format!("Find: {}  ({})", self.query, files.len()) }
+        } else if let Some(portal) = plan.portals.get(name) {
+            let folder = portal.folder.file_name().map_or(name.to_string(), |f| f.to_string_lossy().into_owned());
+            if stack.is_some_and(|s| !s.is_empty()) { folder } else { name.to_string() }
+        } else {
+            name.to_string()
+        };
+        let sort = plan.cfg.sort.iter().find(|(s, _)| s == name).map_or("newest", |(_, h)| h.as_str());
+        let header = settings::Header {
+            title,
+            sort: (name != FIND).then(|| sort_label(sort).to_string()),
+            list: grid.list,
+            pinned: plan.cfg.pinned.iter().any(|p| p == name),
+            tabs: plan.tabs_of(name).map_or(vec![], |list| list.iter().filter(|s| plan.index(s).is_some()).map(|s| (s.clone(), s == name)).collect()),
+            nav: plan.portals.get(name).map(|p| (p.folder.clone(), stack.is_some_and(|s| !s.is_empty()), p.folder.parent().is_some())),
+        };
+        let width = grid.across * grid.cell.0 + 2 * m.pad;
+        let mut items = settings::build_header(&header, width, m.pad, m.dpi);
+        if name == FIND {
+            items.retain(|i| !matches!(i.action, Some(Action::TogglePin | Action::ToggleView))); // a passing list has no settings of its own
+        }
+        items.extend(settings::file_cells(&files, grid));
+        items
+    }
+
+    /// What Settings and the rail have changed since the rules file was read: where portals have been
+    /// navigated to, and what is being typed to find.
+    fn with_current_views(&self, mut plan: Plan) -> Plan {
+        for (name, stack) in &self.nav {
+            if let (Some(folder), true) = (stack.last(), plan.portals.contains_key(name)) {
+                let how = plan.cfg.sort.iter().find(|(s, _)| s == name).map_or("newest", |(_, h)| h.as_str());
+                if let Some(portal) = read_portal(folder.clone(), how) {
+                    plan.portals.insert(name.clone(), portal);
+                }
+            }
+        }
+        if self.find_from.is_some() || self.open.as_deref() == Some(FIND) {
+            let q = self.query.to_lowercase();
+            let hits: Vec<usize> = if q.is_empty() { vec![] } else { plan.labels.iter().enumerate().filter(|(_, l)| l.to_lowercase().contains(&q)).map(|(i, _)| i).collect() };
+            plan.groups.insert(0, (FIND.to_string(), hits));
+        }
+        plan
+    }
+
+    /// Change the rules file, keeping only a result that loads, and put the change on screen.
+    unsafe fn edit_file(&mut self, change: impl FnOnce(&str) -> String) -> Result<(), String> {
+        let before = std::fs::read_to_string(rules_file()).map_err(|e| e.to_string())?;
+        let after = change(&before);
+        if let Err(e) = parse_config(&after) {
+            alert(&e);
+            return Ok(());
+        }
+        std::fs::write(rules_file(), after).map_err(|e| e.to_string())?;
+        self.last_plan = None;
+        self.settle()
+    }
+
+    /// Draw the panel again after its contents changed, without re-reading the desktop.
+    unsafe fn refresh_panel(&mut self) {
+        if let Some(plan) = self.last_plan.take() {
+            self.sync_settings(&plan);
+            self.last_plan = Some(plan);
+            self.repaint_panel();
+        }
+    }
+
+    unsafe fn scroll_panel(&mut self, rows: i32) {
+        if let Some(name) = self.open.clone() {
+            *self.scroll.entry(name).or_insert(0) += rows;
+            self.refresh_panel();
+        }
+    }
+
+    /// Show this portal at another folder.
+    unsafe fn navigate(&mut self, section: &str, folder: PathBuf) -> Result<(), String> {
+        self.nav.entry(section.to_string()).or_default().push(folder);
+        self.scroll.remove(section);
+        self.select(vec![]);
+        self.last_plan = None;
+        self.settle()
+    }
+
+    /// Open the panel of everything matching what has been typed.
+    unsafe fn find_type(&mut self, letter: Option<char>) -> Result<(), String> {
+        match letter {
+            Some(c) => self.query.push(c),
+            None => {
+                self.query.pop();
+            }
+        }
+        if self.find_from.is_none() && self.open.as_deref() != Some(FIND) {
+            self.find_from = Some(self.open.clone().unwrap_or_default());
+            self.open = Some(FIND.to_string());
+        }
+        self.selected.clear();
+        self.scroll.remove(FIND);
+        self.last_plan = None;
+        self.settle()
+    }
+
+    /// Stop finding, and go back to the section that was open.
+    unsafe fn find_end(&mut self) -> Result<(), String> {
+        self.query.clear();
+        let back = self.find_from.take().filter(|s| !s.is_empty());
+        let plan = self.current_plan()?;
+        self.close_open(&plan, false);
+        if back.is_none() && layers::peeking() {
+            layers::set_peek(false); // Find brought the sections up, so it puts them away too
+            self.shortcut_showing = false;
+        }
+        self.open = back;
+        self.last_plan = None;
+        self.settle()
+    }
+
+    /// Save the rules file under the workspace being left, and put another in its place.
+    unsafe fn switch_layout(&mut self, name: &str) -> Result<(), String> {
+        let current = std::fs::read_to_string(current_layout_file()).unwrap_or_default();
+        if !current.trim().is_empty() {
+            let _ = std::fs::copy(rules_file(), layout_file(current.trim()));
+        }
+        let text = std::fs::read_to_string(layout_file(name)).map_err(|e| e.to_string())?;
+        if let Err(e) = parse_config(&text) {
+            alert(&format!("That layout could not be loaded. {e}"));
+            return Ok(());
+        }
+        std::fs::write(rules_file(), text).map_err(|e| e.to_string())?;
+        let _ = std::fs::write(current_layout_file(), name);
+        self.open = None;
+        self.last_plan = None;
+        self.settle()
+    }
+
+    /// The screens changed: keep the layout for the old arrangement, and bring back the new one's.
+    unsafe fn check_screens(&mut self, cfg: &Config) -> bool {
+        let seen = screens_name();
+        if seen == self.screens_seen {
+            return false;
+        }
+        let old = std::mem::replace(&mut self.screens_seen, seen.clone());
+        if old.is_empty() || !cfg.monitor_profiles {
+            return false;
+        }
+        let _ = std::fs::create_dir_all(profiles_dir());
+        let _ = std::fs::copy(rules_file(), profiles_dir().join(format!("{old}.ini")));
+        match std::fs::read_to_string(profiles_dir().join(format!("{seen}.ini"))) {
+            Ok(text) if parse_config(&text).is_ok() => std::fs::write(rules_file(), text).is_ok(),
+            _ => false,
+        }
+    }
+
+    /// Fade the labels toward this much, a few steps at a time.
+    unsafe fn fade_rail(&mut self, target: u32) {
+        let from = (layers::rail_fade() * 100.0) as i32;
+        for step in 1..=8 {
+            layers::set_rail_fade((from + (target as i32 - from) * step / 8) as u32);
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        self.faded = target < 100;
+    }
+
     /// Fill the panel with controls if Settings is the open section, or clear them if not.
     unsafe fn sync_settings(&mut self, plan: &Plan) {
+        settings::LAYOUTS.lock().unwrap().clone_from(&layout_names());
         let items = match self.open.as_deref() {
             Some(SETTINGS) => settings::build(&plan.cfg, self.login, plan.m.dpi),
-            Some(name) => match (plan.portals.get(name), plan.index(name).and_then(|at| plan.panel(at))) {
-                (Some(portal), Some((_, across))) => {
-                    let m = plan.m;
-                    let files: Vec<_> = portal
-                        .files
-                        .iter()
-                        .map(|(path, file)| (path.clone(), file.clone(), cached_icon(&mut self.icons, path, m.dpi)))
-                        .collect();
-                    settings::build_portal(name, &portal.folder, &files, portal.total, across, (m.cell_w, m.cell_h), m.pad, m.dpi)
+            Some(name) if plan.draws_files(name) => {
+                let name = name.to_string();
+                match plan.index(&name).and_then(|at| plan.file_layout(at).map(|l| (at, l))) {
+                    Some((at, (_, grid))) => self.file_panel(plan, at, &name, grid),
+                    None => vec![],
                 }
-                (None, Some((_, across))) if plan.cfg.own_icons => {
-                    let m = plan.m;
-                    let at = plan.index(name).unwrap_or(0);
-                    let files: Vec<_> = plan.groups[at]
-                        .1
-                        .iter()
-                        .map(|&i| {
-                            let path = plan.paths.get(i).cloned().flatten();
-                            let icon = path.as_ref().map_or(0, |p| cached_icon(&mut self.icons, p, m.dpi));
-                            (path, plan.labels[i].clone(), icon)
-                        })
-                        .collect();
-                    settings::build_section(&files, across, (m.cell_w, m.cell_h), m.pad)
-                }
-                _ => vec![],
-            },
-            None => vec![],
+            }
+            _ => vec![],
         };
         // the list may have changed, so find the selected file again and let hover be found afresh
         let selected: Vec<i32> = items.iter().enumerate().filter(|(_, i)| matches!(&i.action, Some(Action::Open(p)) if self.selected.contains(p))).map(|(n, _)| n as i32).collect();
@@ -921,10 +1223,18 @@ impl Sections {
         if !layers::alive() {
             SendMessageW(self.main_window as HWND, WM_REMAKE, 0, 0);
         }
-        let plan = load_plan(&self.desk)?;
-        self.apply_theme(&plan.cfg.theme, &plan.cfg.style);
-        CLICK_AWAY.store(plan.cfg.click_away, Ordering::Relaxed);
+        let mut plan = self.with_current_views(load_plan(&self.desk)?);
+        if self.check_screens(&plan.cfg) {
+            plan = self.with_current_views(load_plan(&self.desk)?);
+        }
+        let panel_colour = plan.cfg.panel_colour.map_or(String::new(), |c| c.to_string());
+        self.apply_theme(&plan.cfg.theme, &plan.cfg.style, &panel_colour, plan.cfg.panel_colour);
+        let pinned = self.open.as_ref().is_some_and(|o| plan.cfg.pinned.contains(o));
+        CLICK_AWAY.store(plan.cfg.click_away && !pinned, Ordering::Relaxed);
         DOUBLE_CLICK_HIDES.store(plan.cfg.double_click_hide, Ordering::Relaxed);
+        HOVER_OPENS.store(plan.cfg.hover_open, Ordering::Relaxed);
+        FADE_ON.store(plan.cfg.fade, Ordering::Relaxed);
+        PEEK_SHORTCUT.store(plan.cfg.peek, Ordering::Relaxed);
         if let Some(open) = &self.open {
             if plan.index(open).is_none() {
                 self.open = None; // that section has emptied
@@ -1069,10 +1379,13 @@ impl Sections {
     /// Fold up the open section; when another is about to open it just vanishes, for a quick switch.
     unsafe fn close_open(&mut self, plan: &Plan, animate: bool) {
         let previous = self.open.take();
+        *HOVER_SECTION.lock().unwrap() = None;
         self.selected.clear();
         self.anchor = -1;
         layers::SELECTED_ITEMS.lock().unwrap().clear();
-        PostMessageW(self.main_window as HWND, WM_GIVE_BACK_KEYS, 0, 0);
+        if !layers::peeking() {
+            PostMessageW(self.main_window as HWND, WM_GIVE_BACK_KEYS, 0, 0);
+        }
         layers::HOVER_ITEM.store(-1, Ordering::Relaxed);
         if let Some(at) = previous.as_deref().and_then(|s| plan.index(s)) {
             self.show_rail(plan);
@@ -1093,13 +1406,33 @@ impl Sections {
     unsafe fn current_plan(&mut self) -> Result<Plan, String> {
         match self.last_plan.take() {
             Some(plan) if plan.labels.len() == self.desk.count() => Ok(plan),
-            _ => load_plan(&self.desk),
+            _ => Ok(self.with_current_views(load_plan(&self.desk)?)),
         }
     }
 
     /// The keyboard shortcut: bring the desktop forward with the last section open, and on the
     /// second press put everything back.
     unsafe fn shortcut(&mut self) -> Result<(), String> {
+        // Peek: the sections come up over the windows, which stay where they are
+        if PEEK_SHORTCUT.load(Ordering::Relaxed) && self.last_plan.as_ref().is_some_and(|p| p.cfg.own_icons) {
+            if layers::peeking() {
+                self.end_peek();
+                return Ok(());
+            }
+            layers::set_peek(true);
+            self.shortcut_showing = true;
+            self.rail_hidden = false;
+            let plan = self.current_plan()?;
+            let wanted = self.open.clone().or_else(|| self.last_section.clone()).filter(|s| plan.index(s).is_some()).or_else(|| plan.groups.first().map(|g| g.0.clone()));
+            self.last_plan = Some(plan);
+            self.settle()?;
+            let shown = match wanted {
+                Some(name) if self.open.as_deref() != Some(name.as_str()) => self.toggle(name),
+                _ => Ok(()),
+            };
+            self.take_keys();
+            return shown;
+        }
         // the taskbar's own show-desktop toggle; faking Win+D would fail with Ctrl and Alt still held
         let show_desktop = || {
             const TOGGLE_DESKTOP: usize = 407;
@@ -1150,6 +1483,14 @@ impl Sections {
         self.settle()
     }
 
+    /// Close with no folding away, for when the mouse has simply left.
+    unsafe fn close_at_once(&mut self) -> Result<(), String> {
+        let plan = self.current_plan()?;
+        self.close_open(&plan, false);
+        let _ = std::fs::write(open_file(), "");
+        self.settle()
+    }
+
     unsafe fn close(&mut self) -> Result<(), String> {
         if self.open.is_none() {
             return Ok(());
@@ -1183,6 +1524,82 @@ impl Sections {
         parse_config(&text)?; // never write a rules file that would not load
         std::fs::write(rules_file(), text).map_err(|e| e.to_string())?;
         self.settle()
+    }
+
+    /// The user answered a question.
+    unsafe fn answered(&mut self, question: Ask, answer: String) -> Result<(), String> {
+        let answer = answer.trim().to_string();
+        let name_taken = |plan: Option<&Plan>, name: &str| plan.is_some_and(|p| p.cfg.order.iter().any(|s| s == name) || p.cfg.portals.iter().any(|(s, _)| s == name));
+        let refuse = |name: &str| alert(&format!("\"{name}\" cannot be used as a name. It may be taken, or contain = , [ ] # or ;"));
+        match question {
+            Ask::RenameSection(old) => {
+                if answer == old {
+                    return Ok(());
+                }
+                if !valid_section_name(&answer) || name_taken(self.last_plan.as_ref(), &answer) {
+                    refuse(&answer);
+                    return Ok(());
+                }
+                self.edit_file(|t| rename_section(t, &old, &answer))
+            }
+            Ask::AddSection => {
+                if !valid_section_name(&answer) || name_taken(self.last_plan.as_ref(), &answer) {
+                    refuse(&answer);
+                    return Ok(());
+                }
+                self.edit_file(|t| add_section(t, &answer))
+            }
+            Ask::NamePortal(folder) => {
+                if !valid_section_name(&answer) || name_taken(self.last_plan.as_ref(), &answer) {
+                    refuse(&answer);
+                    return Ok(());
+                }
+                self.edit_file(|t| add_portal(t, &answer, &folder))
+            }
+            Ask::AddRule => {
+                let Some((pattern, section)) = answer.rsplit_once('=').map(|(p, s)| (p.trim().to_string(), s.trim().to_string())) else {
+                    alert("Write a rule as: pattern = section. For example: *report* = Word");
+                    return Ok(());
+                };
+                let known = self.last_plan.as_ref().is_some_and(|p| p.cfg.order.contains(&section));
+                if !valid_pattern(&pattern) || !known {
+                    alert("That rule needs a working pattern and the name of an existing section.");
+                    return Ok(());
+                }
+                self.edit_file(|t| add_name_rule(t, &pattern, &section))
+            }
+            Ask::SaveLayout => {
+                if !shellmenu::valid_name(&answer) {
+                    alert("That name is not allowed for a layout.");
+                    return Ok(());
+                }
+                let _ = std::fs::create_dir_all(layouts_dir());
+                std::fs::copy(rules_file(), layout_file(&answer)).map_err(|e| e.to_string())?;
+                let _ = std::fs::write(current_layout_file(), &answer);
+                self.settle()
+            }
+        }
+    }
+
+    /// The find shortcut: with the panel over everything if the sections are not in view.
+    unsafe fn begin_find(&mut self) -> Result<(), String> {
+        if self.last_plan.as_ref().is_some_and(|p| p.cfg.own_icons) {
+            layers::set_peek(true);
+        }
+        self.rail_hidden = false;
+        self.query.clear();
+        self.find_from = Some(self.open.clone().unwrap_or_default());
+        self.open = Some(FIND.to_string());
+        self.take_keys();
+        self.last_plan = None;
+        self.settle()
+    }
+
+    unsafe fn end_peek(&mut self) {
+        layers::set_peek(false);
+        self.shortcut_showing = false;
+        let _ = self.close();
+        PostMessageW(self.main_window as HWND, WM_GIVE_BACK_KEYS, 0, 0);
     }
 
     /// Icons Rivulet drew were dragged onto a label: pin them to that section.
@@ -1276,6 +1693,13 @@ impl Sections {
         self.repaint_panel(); // the box itself moved, or has gone
     }
 
+    /// How many rows show at once.
+    fn grid_rows(&self) -> Option<i32> {
+        let plan = self.last_plan.as_ref()?;
+        let at = plan.index(self.open.as_deref()?)?;
+        plan.file_layout(at).map(|(_, g)| g.visible_rows)
+    }
+
     /// How many files there are, and how many fit across, for the arrow keys.
     fn grid(&self) -> Option<(i32, i32)> {
         let plan = self.last_plan.as_ref()?;
@@ -1288,14 +1712,44 @@ impl Sections {
     /// A key, while Rivulet has them. Only files are acted on, and only ones the user chose.
     unsafe fn key(&mut self, key: u32, ctrl: bool, shift: bool) -> Result<(), String> {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
-        if self.open.is_none() || !layers::SETTINGS_ITEMS.lock().unwrap().iter().any(|i| matches!(i.look, Look::File(..))) {
+        let finding_now = self.open.as_deref() == Some(FIND);
+        if self.open.is_none() || (!finding_now && !layers::SETTINGS_ITEMS.lock().unwrap().iter().any(|i| matches!(i.look, Look::File(..)))) {
             return Ok(());
         }
         // portals put a title and a button ahead of their files
         let first = layers::SETTINGS_ITEMS.lock().unwrap().iter().position(|i| matches!(i.look, Look::File(..))).unwrap_or(0) as i32;
         let paths = self.selected.clone();
         let vk = key as u16;
+        let finding = self.open.as_deref() == Some(FIND);
+        if !ctrl {
+            let letter = match vk {
+                0x41..=0x5A => Some((vk as u8 as char).to_ascii_lowercase()),
+                0x30..=0x39 => Some(vk as u8 as char),
+                VK_SPACE => Some(' '),
+                VK_OEM_MINUS => Some(if shift { '_' } else { '-' }),
+                VK_OEM_PERIOD => Some('.'),
+                _ => None,
+            };
+            if let Some(c) = letter {
+                return self.find_type(Some(c));
+            }
+            if vk == VK_BACK && finding {
+                if self.query.is_empty() { return self.find_end() }
+                return self.find_type(None);
+            }
+        }
+        if vk == VK_ESCAPE && finding {
+            return self.find_end();
+        }
+        if vk == VK_ESCAPE && layers::peeking() && paths.is_empty() {
+            self.end_peek();
+            return Ok(());
+        }
         match vk {
+            VK_PRIOR | VK_NEXT => {
+                let page = self.grid_rows().unwrap_or(1).max(1);
+                self.scroll_panel(if vk == VK_PRIOR { -page } else { page });
+            }
             VK_DELETE if !paths.is_empty() => shellmenu::verb(paths, "delete", shift),
             VK_F2 if paths.len() == 1 => {
                 let at = self.chosen().first().copied().unwrap_or(-1);
@@ -1331,6 +1785,12 @@ impl Sections {
                     };
                     let at = self.chosen().last().copied().unwrap_or(first) - first;
                     let to = if self.selected.is_empty() { 0 } else { settings::arrow(at, way, across, count) } + first;
+                    // bring the file into view first, as scrolling makes the list again
+                    if let (Some(name), Some(rows)) = (self.open.clone(), self.grid_rows()) {
+                        let scroll = self.scroll.get(&name).copied().unwrap_or(0);
+                        self.scroll.insert(name, settings::scroll_to_show(to - first, across, rows, scroll));
+                        self.refresh_panel();
+                    }
                     self.select(vec![to]);
                     self.anchor = to;
                 }
@@ -1395,7 +1855,17 @@ impl Sections {
                 }
                 let limit = Duration::from_millis(GetDoubleClickTime() as u64);
                 if self.last_file_click.take().is_some_and(|(t, p)| t.elapsed() <= limit && p == path) {
-                    open_path(&path);
+                    let portal = self.open.clone().filter(|o| self.last_plan.as_ref().is_some_and(|p| p.portals.contains_key(o)));
+                    return match portal {
+                        Some(section) if path.is_dir() => self.navigate(&section, path),
+                        _ => {
+                            open_path(&path);
+                            if layers::peeking() {
+                                self.end_peek();
+                            }
+                            Ok(())
+                        }
+                    };
                 } else {
                     self.last_file_click = Some((Instant::now(), path));
                 }
@@ -1404,6 +1874,105 @@ impl Sections {
             Some(Action::OpenFolder(path)) => {
                 open_path(&path);
                 Ok(())
+            }
+            Some(Action::Page(page)) => {
+                settings::PAGE.store(page, Ordering::Relaxed);
+                self.settle()
+            }
+            Some(Action::CycleSort) => {
+                let Some(name) = self.open.clone() else { return Ok(()) };
+                let now = self.last_plan.as_ref().and_then(|p| p.cfg.sort.iter().find(|(s, _)| *s == name).map(|(_, h)| h.clone())).unwrap_or("newest".into());
+                self.select(vec![]);
+                self.edit_file(|t| set_setting(t, "sort", &name, next_sort(&now)))
+            }
+            Some(Action::ToggleView) => {
+                let Some(name) = self.open.clone() else { return Ok(()) };
+                let list = self.last_plan.as_ref().is_some_and(|p| p.is_list(&name));
+                self.select(vec![]);
+                self.scroll.remove(&name);
+                self.edit_file(|t| set_setting(t, "view", &name, if list { "grid" } else { "list" }))
+            }
+            Some(Action::TogglePin) => {
+                let Some(name) = self.open.clone() else { return Ok(()) };
+                let mut pinned = self.last_plan.as_ref().map_or(vec![], |p| p.cfg.pinned.clone());
+                if pinned.contains(&name) { pinned.retain(|p| *p != name) } else { pinned.push(name) }
+                self.edit_file(|t| set_setting(t, "general", "pinned", &pinned.join(", ")))
+            }
+            Some(Action::Back) => {
+                let Some(name) = self.open.clone() else { return Ok(()) };
+                if let Some(stack) = self.nav.get_mut(&name) {
+                    stack.pop();
+                }
+                self.scroll.remove(&name);
+                self.select(vec![]);
+                self.last_plan = None;
+                self.settle()
+            }
+            Some(Action::Up) => {
+                let Some(name) = self.open.clone() else { return Ok(()) };
+                let parent = self.last_plan.as_ref().and_then(|p| p.portals.get(&name)).and_then(|p| p.folder.parent().map(Path::to_path_buf));
+                match parent {
+                    Some(folder) => self.navigate(&name, folder),
+                    None => Ok(()),
+                }
+            }
+            Some(Action::Show(name)) => {
+                if self.open.as_deref() == Some(name.as_str()) { Ok(()) } else { self.toggle(name) }
+            }
+            Some(Action::PickColour(key)) => {
+                let cfg = self.last_plan.as_ref().map(|p| &p.cfg);
+                let start = cfg.and_then(|c| match key.as_str() {
+                    "panel_colour" => c.panel_colour,
+                    "text_colour" => c.text_colour,
+                    "border_colour" => c.border_colour,
+                    "tint_colour" => c.tint_colour,
+                    other => other.strip_prefix("section:").and_then(|n| c.colours.iter().find(|(s, _)| s == n).map(|(_, v)| *v)),
+                });
+                shellmenu::pick_colour(key, start.unwrap_or(0x00C8B090));
+                Ok(())
+            }
+            Some(Action::ClearLook(keys)) => self.edit_file(|t| keys.iter().fold(t.to_string(), |t, k| remove_setting(&t, "general", k))),
+            Some(Action::PickSymbol(name)) => {
+                *settings::SYMBOL_FOR.lock().unwrap() = name;
+                settings::PAGE.store(5, Ordering::Relaxed);
+                self.settle()
+            }
+            Some(Action::SetSymbol(name, code)) => {
+                settings::PAGE.store(2, Ordering::Relaxed);
+                self.edit_file(|t| set_setting(t, "symbols", &name, &format!("{code:04X}")))
+            }
+            Some(Action::ClearSymbol(name)) => {
+                settings::PAGE.store(2, Ordering::Relaxed);
+                self.edit_file(|t| remove_setting(t, "symbols", &name))
+            }
+            Some(Action::RenameSection(name)) => {
+                shellmenu::ask(Ask::RenameSection(name.clone()), "New name for this section", name);
+                Ok(())
+            }
+            Some(Action::MoveSection(name, by)) => self.edit_file(|t| move_section(t, &name, by)),
+            Some(Action::RemoveSection(name)) => self.edit_file(|t| remove_section(t, &name)),
+            Some(Action::ToggleTab(name)) => self.edit_file(|t| toggle_tab(t, &name)),
+            Some(Action::AddSection) => {
+                shellmenu::ask(Ask::AddSection, "Name of the new section", String::new());
+                Ok(())
+            }
+            Some(Action::AddPortal) => {
+                shellmenu::pick_folder();
+                Ok(())
+            }
+            Some(Action::AddRule) => {
+                shellmenu::ask(Ask::AddRule, "New rule: pattern = section", String::new());
+                Ok(())
+            }
+            Some(Action::RemoveRule(pattern)) => self.edit_file(|t| remove_setting(t, "names", &pattern)),
+            Some(Action::SaveLayout) => {
+                shellmenu::ask(Ask::SaveLayout, "Name for this layout", String::new());
+                Ok(())
+            }
+            Some(Action::LoadLayout(name)) => self.switch_layout(&name),
+            Some(Action::RemoveLayout(name)) => {
+                let _ = std::fs::remove_file(layout_file(&name));
+                self.settle()
             }
             None => {
                 self.take_keys();
@@ -1472,7 +2041,7 @@ unsafe fn restore_spacing(desk: &Desktop) {
 fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Command>, window: usize) {
     unsafe {
         let last_section = open.clone();
-        let mut s = Sections { desk, open, hover: None, hidden: vec![], count: 0, seen: None, last_plan: None, last_section, shortcut_showing: false, rail_hidden: false, login: login_is_on(), tinted_for: String::from("\0"), main_window: window, icons: HashMap::new(), last_file_click: None, selected: vec![], anchor: -1 };
+        let mut s = Sections { desk, open, hover: None, hidden: vec![], count: 0, seen: None, last_plan: None, last_section, shortcut_showing: false, rail_hidden: false, login: login_is_on(), tinted_for: String::from("\0"), main_window: window, icons: HashMap::new(), last_file_click: None, selected: vec![], anchor: -1, scroll: HashMap::new(), nav: HashMap::new(), query: String::new(), find_from: None, screens_seen: String::new(), last_near: Instant::now(), faded: false };
         CoInitializeEx(std::ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32); // file icons and opening files ask for it
         if let Err(e) = s.settle() {
             log(&format!("first sort failed: {e}"));
@@ -1502,6 +2071,65 @@ fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Com
                         }
                     }
                     Ok(())
+                }
+                Ok(Command::Scroll(rows)) => {
+                    s.scroll_panel(rows);
+                    Ok(())
+                }
+                Ok(Command::Answered(question, answer)) => s.answered(question, answer),
+                Ok(Command::ColourChosen(key, hex)) => match key.strip_prefix("section:") {
+                    Some(name) => {
+                        let name = name.to_string();
+                        s.edit_file(|t| set_setting(t, "colours", &name, &hex))
+                    }
+                    None => s.edit_file(|t| set_setting(t, "general", &key, &hex)),
+                },
+                Ok(Command::FolderChosen(folder)) => {
+                    let suggested = Path::new(&folder).file_name().map_or("Folder".to_string(), |n| n.to_string_lossy().into_owned());
+                    shellmenu::ask(Ask::NamePortal(folder), "Name for this folder's label", suggested);
+                    Ok(())
+                }
+                Ok(Command::Find) => s.begin_find(),
+                Ok(Command::Workspace(by)) => {
+                    let names = layout_names();
+                    if names.is_empty() {
+                        Ok(())
+                    } else {
+                        let current = std::fs::read_to_string(current_layout_file()).unwrap_or_default();
+                        let at = names.iter().position(|n| *n == current.trim()).map_or(0, |a| (a as i32 + by).rem_euclid(names.len() as i32) as usize);
+                        s.switch_layout(&names[at])
+                    }
+                }
+                Ok(Command::FadeIn) => {
+                    s.last_near = Instant::now();
+                    if s.faded {
+                        s.fade_rail(100);
+                    }
+                    Ok(())
+                }
+                Ok(Command::PeekOff) => {
+                    s.end_peek();
+                    Ok(())
+                }
+                Ok(Command::HoverOpen(name)) => {
+                    if s.open.as_deref() == Some(name.as_str()) {
+                        Ok(())
+                    } else {
+                        let opened = s.toggle(name.clone());
+                        *HOVER_SECTION.lock().unwrap() = Some(name);
+                        opened
+                    }
+                }
+                Ok(Command::HoverClose) => {
+                    LEAVING.store(false, Ordering::Relaxed);
+                    // a menu or a box asking something belongs to this section, and Peek has its own way out
+                    let pinned = s.open.as_ref().is_some_and(|o| s.last_plan.as_ref().is_some_and(|p| p.cfg.pinned.contains(o)));
+                    let still = HOVER_SECTION.lock().unwrap().is_some() && HOVER_SECTION.lock().unwrap().as_deref() == s.open.as_deref();
+                    if still && !pinned && !shellmenu::SHELL_BUSY.load(Ordering::Relaxed) && !layers::peeking() {
+                        s.close_at_once()
+                    } else {
+                        Ok(())
+                    }
                 }
                 Ok(Command::SelectBox) => {
                     s.select_box();
@@ -1544,6 +2172,13 @@ fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Com
                     return;
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    // the labels fade once they have sat unused for a while, with nothing open
+                    let fade_on = FADE_ON.load(Ordering::Relaxed);
+                    if fade_on && !s.faded && s.open.is_none() && s.last_near.elapsed() > Duration::from_secs(4) {
+                        s.fade_rail(30);
+                    } else if !fade_on && s.faded {
+                        s.fade_rail(100);
+                    }
                     if pretty::drifting() {
                         let mut pt = POINT { x: 0, y: 0 };
                         GetCursorPos(&mut pt);
@@ -1585,6 +2220,14 @@ static DRAG_ITEMS: Mutex<Option<(Vec<String>, Vec<PathBuf>)>> = Mutex::new(None)
 static BOX_FROM: Mutex<Option<POINT>> = Mutex::new(None);
 static BOX_WAITING: AtomicBool = AtomicBool::new(false);
 static PLAIN_PRESS: AtomicBool = AtomicBool::new(false);
+static HOVER_OPENS: AtomicBool = AtomicBool::new(false);
+/// The section open only because the mouse rested on its label. It closes when the mouse leaves,
+/// and a click on its label or inside it makes it stay.
+static HOVER_SECTION: Mutex<Option<String>> = Mutex::new(None);
+static LEAVING: AtomicBool = AtomicBool::new(false);
+static FADE_NUDGED: AtomicBool = AtomicBool::new(false);
+static PEEK_SHORTCUT: AtomicBool = AtomicBool::new(false);
+static FADE_ON: AtomicBool = AtomicBool::new(false);
 static OWNER: AtomicUsize = AtomicUsize::new(0);
 
 unsafe fn over_desktop(pt: POINT) -> bool {
@@ -1686,7 +2329,11 @@ unsafe fn left_down(pt: POINT) -> bool {
     if !over_desktop(pt) {
         return false;
     }
+    let hover_section = HOVER_SECTION.try_lock().ok().and_then(|mut h| h.take());
     if let Some(name) = label_at(pt) {
+        if hover_section.as_deref() == Some(name.as_str()) {
+            return true; // it opened by resting on it; this click keeps it open rather than closing it
+        }
         let mut last = LAST_TOGGLE.lock().unwrap();
         // a double-click is one toggle, not two that cancel out
         if last.map_or(true, |t| t.elapsed() > Duration::from_millis(250)) {
@@ -1695,6 +2342,7 @@ unsafe fn left_down(pt: POINT) -> bool {
         }
     } else if in_panel(pt) {
         if SETTINGS_OPEN.load(Ordering::Relaxed) {
+            // hover_section has been cleared: a click inside means the section is in use
             use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_SHIFT};
             let (ctrl, shift) = (GetAsyncKeyState(VK_CONTROL as i32) < 0, GetAsyncKeyState(VK_SHIFT as i32) < 0);
             PLAIN_PRESS.store(!ctrl && !shift, Ordering::Relaxed);
@@ -1735,7 +2383,43 @@ unsafe fn left_up(pt: POINT) {
     }
 }
 
+/// Whether the mouse is on the way between a section's parts: the labels, the panel, or the gap
+/// between the panel and the label it came from.
+fn keeps_open(pt: POINT, rail: RECT, label: RECT, panel: RECT) -> bool {
+    let inside = |r: RECT| pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;
+    let (left, right) = if rail.right <= panel.left { (rail.right, panel.left) } else { (panel.right, rail.left) };
+    let gap = RECT { left, right, top: label.top.min(panel.top), bottom: label.bottom.max(panel.bottom) };
+    inside(rail) || inside(panel) || inside(gap)
+}
+
+/// Whether the mouse has left the section that opened by resting on its label. Busy locks count as
+/// not having left, as this runs in the mouse hook and another move comes along soon.
+fn has_left_hover_section(pt: POINT) -> bool {
+    let Some(name) = HOVER_SECTION.try_lock().ok().and_then(|h| h.clone()) else { return false };
+    let Some(panel) = PANEL_ON_SCREEN.try_lock().ok().and_then(|p| *p) else { return false };
+    let Ok(labels) = LABELS.try_lock() else { return false };
+    let Some(label) = labels.iter().find(|l| l.name == name) else { return false };
+    let mut rail = label.rect;
+    for l in labels.iter() {
+        rail.top = rail.top.min(l.rect.top);
+        rail.bottom = rail.bottom.max(l.rect.bottom);
+    }
+    !keeps_open(pt, rail, label.rect, panel)
+}
+
 fn mouse_moved(pt: POINT) {
+    if has_left_hover_section(pt) && !LEAVING.swap(true, Ordering::Relaxed) {
+        send(Command::HoverClose);
+    }
+    if FADE_ON.load(Ordering::Relaxed) {
+        // near the labels counts as using them; asked only now and then, as this is the mouse hook
+        let near = LABELS.try_lock().is_ok_and(|labels| labels.iter().any(|l| pt.x >= l.rect.left - 200 && pt.x <= l.rect.right + 200 && pt.y >= l.rect.top - 60 && pt.y <= l.rect.bottom + 60));
+        if near && !FADE_NUDGED.swap(true, Ordering::Relaxed) {
+            send(Command::FadeIn);
+        } else if !near {
+            FADE_NUDGED.store(false, Ordering::Relaxed);
+        }
+    }
     unsafe {
         ghost::moved(pt);
         // over another program a drag becomes a real Windows drag; on the desktop it is for the labels
@@ -1759,6 +2443,16 @@ fn mouse_moved(pt: POINT) {
     if let Ok(mut hovering) = HOVERING.try_lock() {
         if *hovering != hit {
             *hovering = hit.clone();
+            if let Some(name) = hit.clone().filter(|n| HOVER_OPENS.load(Ordering::Relaxed) && n != SETTINGS) {
+                // only if the mouse is still resting there, and is not carrying files to file there
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(350));
+                    let same = HOVERING.lock().is_ok_and(|h| h.as_deref() == Some(name.as_str()));
+                    if same && !ghost::dragging() {
+                        send(Command::HoverOpen(name));
+                    }
+                });
+            }
             send(Command::Hover(hit));
         }
     }
@@ -1779,7 +2473,15 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                     send(Command::Light);
                 }
             }
+            WM_MOUSEWHEEL if SETTINGS_OPEN.load(Ordering::Relaxed) && in_panel(pt) && over_desktop(pt) && panel_has_files() => {
+                let turned = ((*(lparam as *const MSLLHOOKSTRUCT)).mouseData >> 16) as i16;
+                send(Command::Scroll(if turned > 0 { -1 } else { 1 }));
+                return 1;
+            }
             WM_LBUTTONDOWN => {
+                if layers::peeking() && !over_desktop(pt) {
+                    send(Command::PeekOff); // a click elsewhere puts Peek away, and still goes where it was aimed
+                }
                 if left_down(pt) {
                     SWALLOW_RELEASE.store(true, Ordering::Relaxed);
                     return 1;
@@ -1807,6 +2509,9 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 return 1; // our menu, not the desktop's
             }
             WM_RBUTTONDOWN if matches!(file_under(pt), Some(Some(_))) => {
+                if let Ok(mut h) = HOVER_SECTION.try_lock() {
+                    *h = None; // a menu means the section is in use
+                }
                 RIGHT_ON_FILE.store(true, Ordering::Relaxed);
                 return 1; // the file's menu, not the desktop's
             }
@@ -1905,7 +2610,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         WM_RETIDY | WM_DISPLAYCHANGE | WM_DPICHANGED => send(Command::Retidy),
         WM_SETTINGCHANGE if wparam == SPI_SETWORKAREA_CHANGE => send(Command::Retidy), // the taskbar moved
         WM_STOP => send(Command::Stop),
-        WM_HOTKEY => send(Command::Shortcut),
+        WM_HOTKEY => send(match wparam {
+            HOTKEY_FIND => Command::Find,
+            HOTKEY_NEXT => Command::Workspace(1),
+            HOTKEY_PREVIOUS => Command::Workspace(-1),
+            _ => Command::Shortcut,
+        }),
         WM_MENU => show_menu(hwnd),
         WM_TAKE_KEYS => {
             shellmenu::to_front(hwnd);
@@ -2098,6 +2808,14 @@ unsafe fn run() -> Result<(), String> {
         const NO_REPEAT: u32 = 0x4000;
         RegisterHotKey(window, 1, mods | NO_REPEAT, key);
     }
+    {
+        // Ctrl+Alt+F to find, and Page Up / Down between saved layouts. If another program holds one it just goes unused.
+        const NO_REPEAT: u32 = 0x4000;
+        const CTRL_ALT: u32 = 2 | 1;
+        RegisterHotKey(window, HOTKEY_FIND as i32, CTRL_ALT | NO_REPEAT, 0x46);
+        RegisterHotKey(window, HOTKEY_NEXT as i32, CTRL_ALT | NO_REPEAT, 0x22);
+        RegisterHotKey(window, HOTKEY_PREVIOUS as i32, CTRL_ALT | NO_REPEAT, 0x21);
+    }
     let handle = window as usize;
     let desk_for_worker = SendDesktop(desk);
     let thread = std::thread::spawn(move || {
@@ -2287,5 +3005,27 @@ fn main() {
         log(&format!("stopped with a problem: {e}"));
         alert(&e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod hover_tests {
+    use super::*;
+
+    #[test]
+    fn the_way_from_label_to_panel_keeps_a_section_open() {
+        let r = |left, top, right, bottom| RECT { left, top, right, bottom };
+        let (rail, label, panel) = (r(10, 10, 200, 600), r(10, 300, 200, 340), r(300, 100, 900, 500));
+        let at = |x, y| POINT { x, y };
+        assert!(keeps_open(at(100, 320), rail, label, panel)); // on its label
+        assert!(keeps_open(at(100, 50), rail, label, panel)); // on another label
+        assert!(keeps_open(at(250, 320), rail, label, panel)); // crossing the gap
+        assert!(keeps_open(at(600, 300), rail, label, panel)); // in the panel
+        assert!(!keeps_open(at(1000, 300), rail, label, panel)); // past the panel
+        assert!(!keeps_open(at(600, 700), rail, label, panel)); // below it
+        // with the labels on the right
+        let (rail, label, panel) = (r(1700, 10, 1900, 600), r(1700, 300, 1900, 340), r(900, 100, 1600, 500));
+        assert!(keeps_open(at(1650, 320), rail, label, panel));
+        assert!(!keeps_open(at(500, 320), rail, label, panel));
     }
 }

@@ -489,7 +489,7 @@ unsafe fn text_tile(text: &str, w: i32, h: i32, style: Style, flags: u32, dpi: f
     use windows_sys::Win32::Graphics::Gdi::*;
     let (face, size, weight) = layers::style_font(style);
     let pixels = (size * dpi).round() as i32;
-    let key = (text.to_string(), w, h, style as u8, flags, pixels);
+    let key = (format!("{face}\0{text}"), w, h, style as u8, flags, pixels);
     if let Some(tile) = TILES.with(|t| t.borrow().get(&key).cloned()) {
         return tile;
     }
@@ -700,6 +700,17 @@ impl Canvas for PlusCanvas {
         unsafe { draw_text(&self.text, r, s, colour, style, flags, self.dpi) }
     }
 
+    fn outline(&mut self, r: RECT, radius: i32, colour: u32, width: i32) {
+        unsafe {
+            let mut pen = std::ptr::null_mut();
+            GdipCreatePen1(argb(colour, 255), width as f32, UNIT_PIXEL, &mut pen);
+            let path = round_path(r.left as f32, r.top as f32, (r.right - r.left) as f32, (r.bottom - r.top) as f32, radius as f32);
+            GdipDrawPath(self.g, pen, path);
+            GdipDeletePath(path);
+            GdipDeletePen(pen);
+        }
+    }
+
     fn icon(&mut self, x: i32, y: i32, size: i32, icon: isize) {
         unsafe {
             // GDI+ loses an icon's transparency when given it directly, so draw it into memory first
@@ -716,6 +727,13 @@ impl Canvas for PlusCanvas {
             if !dib.is_null() {
                 let old = SelectObject(dc, dib as _);
                 windows_sys::Win32::UI::WindowsAndMessaging::DrawIconEx(dc, 0, 0, icon as _, size, size, 0, std::ptr::null_mut(), windows_sys::Win32::UI::WindowsAndMessaging::DI_NORMAL);
+                let mode = layers::ICON_TINT.load(Ordering::Relaxed);
+                if mode != 0 {
+                    let colour = layers::tint_colour();
+                    for pixel in std::slice::from_raw_parts_mut(bits as *mut u32, (size * size) as usize) {
+                        *pixel = layers::tint_pixel(*pixel, mode, colour);
+                    }
+                }
                 let mut picture = std::ptr::null_mut();
                 if GdipCreateBitmapFromScan0(size, size, size * 4, PARGB, bits as *mut u8, &mut picture) == 0 {
                     // pixel for pixel: the usual smoothing would soften an icon already the right size
@@ -758,6 +776,7 @@ struct Glass {
     pill: [f32; 4],
     look: [f32; 4],
     glow: [f32; 4],
+    fade: [f32; 4],
 }
 
 /// What the card needs to draw liquid glass.
@@ -1248,6 +1267,7 @@ impl Engine {
             place: [self.origin.0 + left, self.origin.1 + top, w, h],
             mouse: [self.mouse.0 - left, self.mouse.1 - top, self.mouse.2, 0.0],
             look: [look, clock_seconds(), 1.0, 0.0],
+            fade: [layers::rail_fade(), 0.0, 0.0, 0.0],
             ..Default::default()
         }
     }
@@ -1358,13 +1378,14 @@ impl Engine {
             let numbers = Glass {
                 box_: [(p.x - left) as f32, (p.y - top) as f32, p.w as f32, p.h as f32],
                 shape: [p.radius as f32, band, if settings { 3.2 } else { 0.9 }, dpi],
-                tint: card_colour(tint, if settings { if base.look[0] == 1.0 { 0.42 } else { 0.66 } } else { 0.10 }),
+                tint: card_colour(tint, if settings { (if base.look[0] == 1.0 { 0.42 } else { 0.66 } * layers::panel_strength()).min(0.95) } else { 0.10 }),
                 mouse: [base.mouse[0], base.mouse[1], base.mouse[2], if settings { 0.2 } else { 0.32 }],
                 neck0: [fx, fy, mid, fy],
                 neck1: [mid, ty, tx, ty],
                 neck2: [if pill.is_some() { 1.0 } else { 0.0 }, n.reach.clamp(0.02, 1.0), n.end_width / 2.0, n.mid_width / 2.0],
                 pill: pill.unwrap_or([0.0; 4]),
                 glow: vivid(layers::accent()),
+                fade: [1.0, 0.0, 0.0, 0.0],
                 ..base
             };
             let names = if settings { self.panel_text.views() } else { None };
@@ -1411,6 +1432,16 @@ impl Engine {
                     }
                 }
             }
+            let fade = layers::rail_fade();
+            if fade < 1.0 {
+                if let Some(page) = rail.page.as_mut() {
+                    let keep = (fade * 256.0) as u32;
+                    for p in page.pixels.iter_mut() {
+                        let (rb, ag) = (*p & 0x00FF_00FF, (*p >> 8) & 0x00FF_00FF);
+                        *p = ((rb * keep >> 8) & 0x00FF_00FF) | ((ag * keep) & 0xFF00_FF00);
+                    }
+                }
+            }
             self.show(&rail, x as f32, y as f32);
         }
         self.rail = rail;
@@ -1447,6 +1478,19 @@ mod tests {
     fn the_card_gets_colour_mixed_with_the_amounts() {
         assert_eq!(colour_for_card(0x00FF_8000, 0xFFFF_FFFF), 0x00FF_8000);
         assert_eq!(colour_for_card(0x00FF_FF00, 0xFFC0_2040), 0x00C0_2000);
+    }
+
+    #[test]
+    fn tinting_keeps_transparency_and_leaves_clear_pixels_clear() {
+        assert_eq!(layers::tint_pixel(0x8010_2030, 0, 0x00FF_00FF), 0x8010_2030);
+        let grey = layers::tint_pixel(0xFF40_8020, 2, 0);
+        assert_eq!(grey >> 24, 0xFF);
+        assert_eq!((grey >> 16) & 255, grey & 255);
+        assert_eq!(layers::tint_pixel(0, 1, 0x00FF_FFFF), 0);
+        assert_eq!(layers::tint_pixel(0, 2, 0x00FF_FFFF), 0);
+        // no colour channel may pass its transparency, or it would glow
+        let t = layers::tint_pixel(0x4020_2020, 1, 0x00FF_FFFF);
+        assert!((t >> 16) & 255 <= 0x40 && (t >> 8) & 255 <= 0x40 && t & 255 <= 0x40);
     }
 
     #[test]
@@ -1603,9 +1647,9 @@ pub unsafe fn set_panel(x: i32, y: i32, w: i32, h: i32, radius: i32) {
             let (shade, accent, pill) = (layers::panel_tint(), layers::accent(), layers::pill_tint());
             // real glass lets more through; text on Settings still has to stay easy to read
             let alpha = match (frosted, settings) {
-                (true, true) => 205,
+                (true, true) => (205.0 * layers::panel_strength()).min(250.0) as _,
                 (true, false) => 120,
-                (false, true) => 244,
+                (false, true) => (244.0 * layers::panel_strength()).min(250.0) as _,
                 (false, false) => 190,
             };
             let (top, bottom) = (blend(blend(shade, accent, 0.10), 0x00FFFFFF, 0.05), blend(shade, accent, 0.04));

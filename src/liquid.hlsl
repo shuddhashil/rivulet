@@ -14,6 +14,7 @@ cbuffer Glass : register(b0) {
     float4 pill;   // the label the neck comes out of
     float4 look;   // 0 liquid, 1 aurora, 2 neon; seconds; how strongly this piece glows
     float4 glow;   // this section's colour
+    float4 fade;   // x: how visible this piece is, 0 to 1
 };
 
 Texture2D picture : register(t0);
@@ -76,7 +77,7 @@ float3 wallpaper(float2 at, float level) {
                  + picture.SampleLevel(smooth_sampler, uv + spread * float2(0.4, -1), level).rgb);
 }
 
-float4 glass(float4 position : SV_Position) : SV_Target {
+float4 glass_core(float4 position : SV_Position) : SV_Target {
     float2 p = position.xy;
     float scale = shape.w;
     float d = glass_distance(p);
@@ -189,8 +190,12 @@ float4 glass(float4 position : SV_Position) : SV_Target {
     return float4(colour * cover, cover) + float4(0, 0, 0, 0.30 * (1 - cover));
 }
 
+float4 glass(float4 position : SV_Position) : SV_Target {
+    return glass_core(position) * fade.x;
+}
+
 float4 words(float4 position : SV_Position) : SV_Target {
-    return picture.Load(int3(position.xy, 0));
+    return picture.Load(int3(position.xy, 0)) * fade.x;
 }
 
 // Text with each of red, green and blue covered by its own amount, as ClearType asks: t0 holds the
@@ -204,10 +209,10 @@ struct NamesOut {
 };
 
 NamesOut names(float4 position : SV_Position) {
-    float3 cover = text_cover.Load(int3(position.xy, 0)).rgb;
+    float3 cover = text_cover.Load(int3(position.xy, 0)).rgb * fade.x;
     float most = max(cover.r, max(cover.g, cover.b));
     NamesOut out_;
-    out_.colour = float4(picture.Load(int3(position.xy, 0)).rgb, most);
+    out_.colour = float4(picture.Load(int3(position.xy, 0)).rgb * fade.x, most);
     out_.keep = float4(cover, most);
     return out_;
 }

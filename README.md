@@ -19,7 +19,7 @@ Rivulet sorts your desktop icons by type into a slim rail of labels on the left.
 
 - Sections by file type: Folders, Word, Excel, PowerPoint, PDF, Notes, Code, Apps, Zips.
 - **Recent** shows what you created or changed in the last 3 days, wherever it belongs.
-- **Folder portals** add a label for any folder, such as Downloads or a cloud folder, showing its newest files without moving anything. Double-click a file to open it.
+- **Folder portals** add a label for any folder, such as Downloads or a cloud folder, without moving anything. Scroll through it, open subfolders inside the panel, and go Back or Up.
 - **A dot** on a label means something new arrived that you have not looked at.
 - **Drag an icon onto a label** to file it there for good.
 - **Ctrl+Alt+D** shows the desktop with your last section open. Press again to go back.
@@ -28,6 +28,24 @@ Rivulet sorts your desktop icons by type into a slim rail of labels on the left.
 - **Six styles.** Plain is the default and uses 2-3 MB. Smooth adds soft corners and shadows (60-90 MB). Glass is frosted glass made from your own wallpaper (55-100 MB). Liquid is clear glass drawn by a shader on the graphics card: the wallpaper bends through the rim with a touch of colour fringing, the panel, neck and label melt into one shape, the light follows your mouse, and the glass deepens over bright wallpaper so text stays readable (80-130 MB). Aurora fills the glass with slow curtains of colour from your wallpaper and sections, moving only while a section is open or the mouse is near. Neon is dark glass with a lit tube round each edge in the section's colour, spilling light that brightens as the mouse comes close. All but Plain need the graphics card; with Plain, those libraries are never loaded.
 - Colours per section, five themes, and tints that follow your wallpaper.
 - New files are sorted as they arrive, and it recovers by itself if Explorer restarts.
+
+### Rivulet's own icons
+
+Set **Settings > General > Icons** to Rivulet and it draws your icons itself, so Explorer's hover box never shows. It is off by default, and switching back is one click. In this mode you also get:
+
+- Hover and selection highlights, Ctrl, Shift and box selection, and the real right-click menu.
+- Dragging files onto a label or into another program.
+- Scrolling, list view with dates and sizes, and a sort order for each section.
+- **Pin** to keep a section open, and tabs that join related sections in one panel.
+- **Ctrl+Alt+F** to find any desktop file by typing.
+- **Peek**: an option that makes Ctrl+Alt+D bring the sections up over your open windows.
+
+### Settings pages
+
+- **Appearance:** font, text and icon size, icon tint, corners, how solid panels are, and panel, text, border and tint colours.
+- **Sections:** add, rename, reorder, recolour or remove sections, choose symbols, add folder portals and join tabs, without editing any text.
+- **Rules:** add or remove rules, including `size>100mb` and `age<7d` as well as name patterns.
+- **Layouts:** save and switch named layouts (Ctrl+Alt+Page Up / Down), and optionally keep one for each screen setup.
 
 ## Install
 
@@ -53,6 +71,10 @@ cargo build --release
 | Hide or show the labels | Double-click empty desktop |
 | Change themes and behaviour | Click the Settings label |
 | Re-sort, edit rules, undo or stop | Right-click any label |
+| Find a file (Rivulet's icons) | Ctrl+Alt+F, or click a file and type |
+| Move between saved layouts | Ctrl+Alt+Page Up / Down |
+| Delete, rename, open | Delete, F2, Enter, after clicking a file |
+| Select all, copy, cut, paste | Ctrl+A, Ctrl+C, Ctrl+X, Ctrl+V |
 
 ## Your own rules
 

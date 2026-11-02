@@ -6,7 +6,7 @@ use crate::rules::{blend, neck_outline};
 use crate::settings::{Item, Look};
 use crate::wallpaper::wide;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -74,6 +74,8 @@ pub trait Canvas {
     }
     fn text(&mut self, r: RECT, s: &str, colour: u32, style: Style, flags: u32);
     fn icon(&mut self, x: i32, y: i32, size: i32, icon: isize);
+    /// A line round a rounded box.
+    fn outline(&mut self, r: RECT, radius: i32, colour: u32, width: i32);
 }
 
 struct GdiCanvas {
@@ -84,7 +86,7 @@ struct GdiCanvas {
 impl GdiCanvas {
     unsafe fn new(dc: HDC, dpi: f32) -> GdiCanvas {
         SetBkMode(dc, TRANSPARENT as _);
-        GdiCanvas { dc, fonts: [font("Segoe UI", 13.0 * dpi, 600), font("Segoe UI", 11.0 * dpi, 400), font("Segoe UI", 14.0 * dpi, 700), font("Segoe MDL2 Assets", 14.0 * dpi, 400), font("Segoe UI", (12.0 * dpi).round(), 400)] }
+        GdiCanvas { dc, fonts: [{ let (f, s, w) = style_font(Style::Label); font(f, s * dpi, w) }, { let (f, s, w) = style_font(Style::Small); font(f, s * dpi, w) }, { let (f, s, w) = style_font(Style::Heading); font(f, s * dpi, w) }, font("Segoe MDL2 Assets", 14.0 * dpi, 400), { let (f, s, w) = style_font(Style::Name); font(f, (s * dpi).round(), w) }] }
     }
 }
 
@@ -135,7 +137,44 @@ impl Canvas for GdiCanvas {
 
     fn icon(&mut self, x: i32, y: i32, size: i32, icon: isize) {
         unsafe {
-            DrawIconEx(self.dc, x, y, icon as HICON, size, size, 0, null_mut(), DI_NORMAL);
+            let mode = ICON_TINT.load(Ordering::Relaxed);
+            if mode == 0 {
+                DrawIconEx(self.dc, x, y, icon as HICON, size, size, 0, null_mut(), DI_NORMAL);
+                return;
+            }
+            // tinted: draw into memory, change the pixels, and lay the result down with its transparency
+            let mut info: BITMAPINFO = std::mem::zeroed();
+            info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            info.bmiHeader.biWidth = size;
+            info.bmiHeader.biHeight = -size;
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            let dc = CreateCompatibleDC(self.dc);
+            let mut bits = null_mut();
+            let dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+            if !dib.is_null() {
+                let old = SelectObject(dc, dib as _);
+                DrawIconEx(dc, 0, 0, icon as HICON, size, size, 0, null_mut(), DI_NORMAL);
+                for pixel in std::slice::from_raw_parts_mut(bits as *mut u32, (size * size) as usize) {
+                    *pixel = tint_pixel(*pixel, mode, tint_colour());
+                }
+                let blend = BLENDFUNCTION { BlendOp: 0, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: 1 };
+                AlphaBlend(self.dc, x, y, size, size, dc, 0, 0, size, size, blend);
+                SelectObject(dc, old);
+                DeleteObject(dib as _);
+            }
+            DeleteDC(dc);
+        }
+    }
+
+    fn outline(&mut self, r: RECT, radius: i32, colour: u32, width: i32) {
+        unsafe {
+            let pen = CreatePen(0, width, colour);
+            let (old_pen, old_brush) = (SelectObject(self.dc, pen as _), SelectObject(self.dc, GetStockObject(NULL_BRUSH)));
+            RoundRect(self.dc, r.left, r.top, r.right, r.bottom, radius, radius);
+            SelectObject(self.dc, old_pen);
+            SelectObject(self.dc, old_brush);
+            DeleteObject(pen as _);
         }
     }
 }
@@ -223,21 +262,114 @@ pub fn set_accent(colour: u32) {
 
 /// The Settings panel needs its text readable; icon panels stay more see-through.
 pub unsafe fn set_settings(items: Vec<Item>) {
-    let alpha = if items.is_empty() { PANEL_SEE_THROUGH } else { PANEL_READABLE };
+    let empty = items.is_empty();
     *SETTINGS_ITEMS.lock().unwrap() = items;
+    let alpha = if empty { PANEL_SEE_THROUGH } else { (PANEL_READABLE as f32 * panel_strength()).min(250.0) as u8 };
     SetLayeredWindowAttributes(panel(), 0, alpha, LWA_ALPHA_FLAG);
     InvalidateRect(panel(), null(), 0);
+    let peeked = PEEK_PANEL.load(Ordering::Relaxed);
+    if peeked != 0 {
+        InvalidateRect(peeked as HWND, null(), 0);
+    }
+}
+
+/// What the Appearance page chose, read while drawing.
+static FACE: Mutex<&'static str> = Mutex::new("Segoe UI");
+static TEXT_SCALE: AtomicU32 = AtomicU32::new(100);
+static PANEL_PERCENT: AtomicU32 = AtomicU32::new(100);
+pub static ICON_TINT: AtomicU32 = AtomicU32::new(0);
+const NOT_CHOSEN: u32 = u32::MAX;
+static TEXT_COLOUR: AtomicU32 = AtomicU32::new(NOT_CHOSEN);
+static BORDER_COLOUR: AtomicU32 = AtomicU32::new(NOT_CHOSEN);
+static TINT_COLOUR: AtomicU32 = AtomicU32::new(NOT_CHOSEN);
+/// The panel as now drawn: width, height, corner radius.
+static PANEL_SHAPE: Mutex<(i32, i32, i32)> = Mutex::new((0, 0, 0));
+/// How visible the labels are, percent.
+static RAIL_FADE: AtomicU32 = AtomicU32::new(100);
+
+fn text_colour() -> u32 {
+    match TEXT_COLOUR.load(Ordering::Relaxed) {
+        NOT_CHOSEN => WHITE,
+        chosen => chosen,
+    }
+}
+
+pub fn tint_colour() -> u32 {
+    match TINT_COLOUR.load(Ordering::Relaxed) {
+        NOT_CHOSEN => accent(),
+        chosen => chosen,
+    }
+}
+
+pub fn rail_fade() -> f32 {
+    RAIL_FADE.load(Ordering::Relaxed) as f32 / 100.0
+}
+
+pub unsafe fn set_rail_fade(percent: u32) {
+    RAIL_FADE.store(percent, Ordering::Relaxed);
+    if !crate::pretty::is_on() {
+        SetLayeredWindowAttributes(rail(), 0, (225 * percent / 100).max(1) as u8, LWA_ALPHA_FLAG);
+    } else {
+        crate::pretty::repaint_rail();
+    }
+}
+
+pub fn apply_look(cfg: &crate::rules::Config) {
+    if let Ok(mut face) = FACE.lock() {
+        *face = match cfg.font.as_str() {
+            "calibri" => "Calibri",
+            "arial" => "Arial",
+            "verdana" => "Verdana",
+            "tahoma" => "Tahoma",
+            _ => "Segoe UI",
+        };
+    }
+    TEXT_SCALE.store(match cfg.text_size.as_str() { "small" => 90, "large" => 115, _ => 100 }, Ordering::Relaxed);
+    PANEL_PERCENT.store(cfg.glass, Ordering::Relaxed);
+    TEXT_COLOUR.store(cfg.text_colour.unwrap_or(NOT_CHOSEN), Ordering::Relaxed);
+    BORDER_COLOUR.store(cfg.border_colour.unwrap_or(NOT_CHOSEN), Ordering::Relaxed);
+    TINT_COLOUR.store(cfg.tint_colour.unwrap_or(NOT_CHOSEN), Ordering::Relaxed);
+    ICON_TINT.store(match cfg.icon_tint.as_str() { "section" => 1, "mono" => 2, _ => 0 }, Ordering::Relaxed);
+    crate::settings::ICON_SIZE.store(match cfg.icon_size.as_str() { "small" => 0, "large" => 2, _ => 1 }, Ordering::Relaxed);
+}
+
+/// How much a panel of files lets through, against normal being 1.
+pub fn panel_strength() -> f32 {
+    let files = SETTINGS_ITEMS.lock().is_ok_and(|i| i.iter().any(|x| matches!(x.look, Look::File(..))));
+    if files { PANEL_PERCENT.load(Ordering::Relaxed) as f32 / 100.0 } else { 1.0 }
+}
+
+/// How high a line of file name is, in pixels.
+pub fn name_line(dpi: f32) -> i32 {
+    ((12.0 * dpi * TEXT_SCALE.load(Ordering::Relaxed) as f32 / 100.0).round() * 1.36) as i32
 }
 
 /// Each style's font: name, size at 100% scale, weight.
 pub fn style_font(style: Style) -> (&'static str, f32, i32) {
+    let face = FACE.lock().map_or("Segoe UI", |f| *f);
+    let scale = TEXT_SCALE.load(Ordering::Relaxed) as f32 / 100.0;
     match style {
-        Style::Name => ("Segoe UI", 12.0, 400),
-        Style::Label => ("Segoe UI", 13.0, 600),
-        Style::Small => ("Segoe UI", 11.0, 400),
-        Style::Heading => ("Segoe UI", 14.0, 700),
+        Style::Name => (face, 12.0 * scale, 400),
+        Style::Label => (face, 13.0 * scale, 600),
+        Style::Small => (face, 11.0 * scale, 400),
+        Style::Heading => (face, 14.0 * scale, 700),
         Style::Glyph => ("Segoe MDL2 Assets", 14.0, 400),
     }
+}
+
+/// An icon's pixel, colours already mixed with transparency, in grey or the section's colour.
+pub fn tint_pixel(pixel: u32, mode: u32, colour: u32) -> u32 {
+    if mode == 0 {
+        return pixel;
+    }
+    let (a, r, g, b) = (pixel >> 24, (pixel >> 16) & 255, (pixel >> 8) & 255, pixel & 255);
+    let grey = (r * 30 + g * 59 + b * 11) / 100;
+    if mode == 2 {
+        return (a << 24) | (grey << 16) | (grey << 8) | grey;
+    }
+    // colour is red in its low byte; three parts tint to one part of the icon's own shade
+    let mix = |own: u32, tint: u32| (own + 3 * (tint * grey / 255) * 2).min(4 * a.max(1)) / 4;
+    (a << 24) | (mix(r, colour & 255).min(a) << 16) | (mix(g, (colour >> 8) & 255).min(a) << 8) | mix(b, (colour >> 16) & 255).min(a)
 }
 
 unsafe fn font(name: &str, size: f32, weight: i32) -> HFONT {
@@ -254,6 +386,60 @@ pub fn pill_colour(p: &Pill, base: u32) -> u32 {
     }
 }
 
+// ---------- Peek: the same labels and panel in windows of their own, above everything
+
+static PEEK_ON: AtomicBool = AtomicBool::new(false);
+static PEEK_RAIL: AtomicUsize = AtomicUsize::new(0);
+static PEEK_PANEL: AtomicUsize = AtomicUsize::new(0);
+
+pub fn peeking() -> bool {
+    PEEK_ON.load(Ordering::Relaxed)
+}
+
+/// These use the sections' own window class, so the mouse handling treats them as the sections.
+pub unsafe fn set_peek(on: bool) {
+    if PEEK_ON.swap(on, Ordering::Relaxed) == on {
+        return;
+    }
+    if on {
+        let class = wide(CLASS);
+        let make = || {
+            let h = CreateWindowExW(WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TOOLWINDOW, class.as_ptr(), class.as_ptr(), WS_POPUP, 0, 0, 1, 1, null_mut(), null_mut(), GetModuleHandleW(null()), null());
+            SetLayeredWindowAttributes(h, 0, 248, LWA_ALPHA_FLAG);
+            h as usize
+        };
+        PEEK_PANEL.store(make(), Ordering::Relaxed);
+        PEEK_RAIL.store(make(), Ordering::Relaxed);
+    } else {
+        for slot in [&PEEK_RAIL, &PEEK_PANEL] {
+            let h = slot.swap(0, Ordering::Relaxed);
+            if h != 0 {
+                DestroyWindow(h as HWND);
+            }
+        }
+    }
+}
+
+/// From the sections' parent window to the screen.
+unsafe fn parent_to_screen(x: i32, y: i32) -> (i32, i32) {
+    let mut p = POINT { x, y };
+    ClientToScreen(GetParent(rail()), &mut p);
+    (p.x, p.y)
+}
+
+unsafe fn peek_place(slot: &AtomicUsize, x: i32, y: i32, w: i32, h: i32, shape: HRGN) {
+    let window = slot.load(Ordering::Relaxed) as HWND;
+    if window.is_null() {
+        DeleteObject(shape as _);
+        return;
+    }
+    let (sx, sy) = parent_to_screen(x, y);
+    SetWindowPos(window, HWND_TOPMOST, sx, sy, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowRgn(window, shape, 1);
+    InvalidateRect(window, null(), 0);
+    UpdateWindow(window);
+}
+
 pub fn paint_rail_on(c: &mut dyn Canvas, dpi: f32, base: u32) {
     let scaled = |v: f32| (v * dpi) as i32;
     if let Ok(pills) = PILLS.lock() {
@@ -267,7 +453,7 @@ pub fn paint_rail_on(c: &mut dyn Canvas, dpi: f32, base: u32) {
                 c.text(area, &p.count.to_string(), if p.active { 0x00F0F0F0 } else { SOFT }, Style::Label, DT_RIGHT);
                 area.right -= scaled(24.0);
             }
-            c.text(area, &p.name, WHITE, Style::Label, DT_LEFT | DT_END_ELLIPSIS);
+            c.text(area, &p.name, text_colour(), Style::Label, DT_LEFT | DT_END_ELLIPSIS);
             if p.fresh {
                 let (size, x, y) = (scaled(7.0), r.left + scaled(25.0), r.top + scaled(6.0));
                 c.fill(RECT { left: x - 1, top: y - 1, right: x + size + 1, bottom: y + size + 1 }, size + 2, WHITE);
@@ -284,10 +470,36 @@ pub fn paint_settings_on(c: &mut dyn Canvas, dpi: f32, base: u32, accent: u32) {
     if let Ok(items) = SETTINGS_ITEMS.lock() {
         for (index, item) in items.iter().enumerate() {
             let r = item.rect;
+            if r.right <= r.left {
+                continue; // scrolled out of view
+            }
             match &item.look {
-                Look::Heading(t) => c.text(r, t, WHITE, Style::Heading, DT_LEFT),
-                Look::Text(t) => c.text(RECT { right: r.right + (200.0 * dpi) as i32, ..r }, t, 0x00E8E4E0, Style::Label, DT_LEFT),
-                Look::Note(t) => c.text(r, t, SOFT, Style::Small, DT_LEFT),
+                Look::Thumb => c.wash(r, r.right - r.left, WHITE, 110),
+                Look::Swatch(colour) => {
+                    c.fill(r, radius, *colour);
+                    c.outline(r, radius, 0x00D0D0D0, 1);
+                }
+                Look::Symbol(glyph) => {
+                    c.fill(r, radius, idle);
+                    c.text(r, &glyph.to_string(), WHITE, Style::Glyph, DT_CENTER);
+                }
+                Look::File(name, icon) if item.row => {
+                    let inset = (2.0 * dpi) as i32;
+                    let selected = chosen.contains(&(index as i32));
+                    if selected || HOVER_ITEM.load(Ordering::Relaxed) == index as i32 {
+                        c.wash(RECT { left: r.left + inset, top: r.top + inset / 2, right: r.right - inset, bottom: r.bottom - inset / 2 }, (6.0 * dpi) as i32, accent, if selected { 140 } else { 90 });
+                    }
+                    let size = crate::settings::list_icon_pixels(dpi);
+                    let side = (8.0 * dpi) as i32;
+                    c.icon(r.left + side, r.top + (r.bottom - r.top - size) / 2, size, *icon);
+                    let name_left = r.left + side * 2 + size;
+                    let detail_w = (170.0 * dpi) as i32;
+                    c.text(RECT { left: name_left, top: r.top, right: r.right - detail_w - side, bottom: r.bottom }, name, text_colour(), Style::Name, DT_LEFT | DT_END_ELLIPSIS);
+                    c.text(RECT { left: r.right - detail_w, top: r.top, right: r.right - side, bottom: r.bottom }, &item.detail, SOFT, Style::Small, DT_RIGHT);
+                }
+                Look::Heading(t) => c.text(r, t, text_colour(), Style::Heading, DT_LEFT | DT_END_ELLIPSIS),
+                Look::Text(t) => c.text(RECT { right: r.right + (200.0 * dpi) as i32, ..r }, t, text_colour(), Style::Label, DT_LEFT),
+                Look::Note(t) => c.text(r, t, if TEXT_COLOUR.load(Ordering::Relaxed) == NOT_CHOSEN { SOFT } else { text_colour() }, Style::Small, DT_LEFT | DT_END_ELLIPSIS),
                 Look::Value(t) => c.text(r, t, WHITE, Style::Label, DT_CENTER),
                 Look::File(name, icon) => {
                     let selected = chosen.contains(&(index as i32));
@@ -301,8 +513,8 @@ pub fn paint_settings_on(c: &mut dyn Canvas, dpi: f32, base: u32, accent: u32) {
                     let top = r.top + (6.0 * dpi) as i32;
                     c.icon((r.left + r.right - size) / 2, top, size, *icon);
                     let inset = (5.0 * dpi) as i32;
-                    let words = RECT { left: r.left + inset, top: top + size + inset / 2, right: r.right - inset, bottom: top + size + (38.0 * dpi) as i32 };
-                    c.text(words, name, WHITE, Style::Name, DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
+                    let words = RECT { left: r.left + inset, top: top + size + inset / 2, right: r.right - inset, bottom: top + size + inset / 2 + 2 * name_line(dpi) + 2 };
+                    c.text(words, name, text_colour(), Style::Name, DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
                 }
                 Look::Button(t) => {
                     c.fill(r, radius, idle);
@@ -323,6 +535,14 @@ pub fn paint_settings_on(c: &mut dyn Canvas, dpi: f32, base: u32, accent: u32) {
             }
         }
     }
+    let border = BORDER_COLOUR.load(Ordering::Relaxed);
+    if border != NOT_CHOSEN {
+        if let Ok((w, h, corner)) = PANEL_SHAPE.lock().map(|s| *s) {
+            let width = (1.5 * dpi).round() as i32;
+            let inset = width / 2;
+            c.outline(RECT { left: inset, top: inset, right: w - inset - 1, bottom: h - inset - 1 }, corner * 2, border, width);
+        }
+    }
     if let Ok(Some(area)) = SELECT_BOX.lock().map(|b| *b) {
         c.wash(area, (4.0 * dpi) as i32, accent, 70);
     }
@@ -340,9 +560,9 @@ unsafe extern "system" fn layer_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             let (pill, shade) = (PILL_TINT.load(Ordering::Relaxed), PANEL_TINT.load(Ordering::Relaxed));
             let dpi = GetDpiForWindow(hwnd) as f32 / 96.0;
             let mut canvas = GdiCanvas::new(dc, dpi);
-            if hwnd == rail() {
+            if hwnd == rail() || hwnd as usize == PEEK_RAIL.load(Ordering::Relaxed) {
                 paint_rail_on(&mut canvas, dpi, pill);
-            } else if hwnd == panel() {
+            } else if hwnd == panel() || hwnd as usize == PEEK_PANEL.load(Ordering::Relaxed) {
                 canvas.fill(whole, 0, blend(shade, accent, 0.06));
                 let frame = CreateRectRgn(0, 0, 0, 0);
                 if GetWindowRgn(hwnd, frame) != 0 {
@@ -428,6 +648,17 @@ unsafe fn hide_plain_panel() {
 
 /// Lay the rail out from the current pills.
 pub unsafe fn show_rail(x: i32, y: i32, w: i32, h: i32, radius: i32) {
+    if peeking() {
+        let shape = CreateRectRgn(0, 0, 0, 0);
+        if let Ok(pills) = PILLS.lock() {
+            for p in pills.iter() {
+                let one = CreateRoundRectRgn(p.rect.left, p.rect.top, p.rect.right + 1, p.rect.bottom + 1, radius, radius);
+                CombineRgn(shape, shape, one, RGN_OR);
+                DeleteObject(one as _);
+            }
+        }
+        peek_place(&PEEK_RAIL, x, y, w, h, shape);
+    }
     if crate::pretty::is_on() {
         return crate::pretty::show_rail(x, y, w, h);
     }
@@ -452,6 +683,10 @@ pub unsafe fn hide_rail() {
 }
 
 pub unsafe fn repaint_rail() {
+    let peeked = PEEK_RAIL.load(Ordering::Relaxed);
+    if peeked != 0 {
+        InvalidateRect(peeked as HWND, null(), 0);
+    }
     if crate::pretty::is_on() {
         return crate::pretty::repaint_rail();
     }
@@ -460,6 +695,10 @@ pub unsafe fn repaint_rail() {
 }
 
 pub unsafe fn hide_panel() {
+    let peeked = PEEK_PANEL.load(Ordering::Relaxed);
+    if peeked != 0 {
+        ShowWindow(peeked as HWND, SW_HIDE);
+    }
     if crate::pretty::is_on() {
         return crate::pretty::hide_panel();
     }
@@ -467,6 +706,12 @@ pub unsafe fn hide_panel() {
 }
 
 pub unsafe fn set_panel(x: i32, y: i32, w: i32, h: i32, radius: i32) {
+    if let Ok(mut shape) = PANEL_SHAPE.lock() {
+        *shape = (w, h, radius);
+    }
+    if peeking() {
+        peek_place(&PEEK_PANEL, x, y, w.max(2), h.max(2), CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius));
+    }
     if crate::pretty::is_on() {
         return crate::pretty::set_panel(x, y, w, h, radius);
     }

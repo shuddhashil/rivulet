@@ -16,7 +16,7 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{CreateFontW, DeleteObject, GetStockObject, DEFAULT_GUI_FONT};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{mouse_event, GetFocus, SetFocus, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, VK_ESCAPE, VK_RETURN};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{mouse_event, SetFocus, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, VK_ESCAPE, VK_RETURN};
 use windows_sys::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_PIDL};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -493,40 +493,34 @@ fn stem_length(name: &str) -> usize {
     }
 }
 
-unsafe fn rename_box(path: &Path, at: POINT) {
-    let Some(old) = path.file_name().map(|n| n.to_string_lossy().to_string()) else { return };
-    if path.to_string_lossy().starts_with("shell:") {
-        return;
-    }
-    let class = wide("EDIT");
-    let text = wide(&old);
-    const ES_AUTOHSCROLL_STYLE: u32 = 0x0080;
+/// A small box asking for a line of text, at this spot. None if it was closed without Enter.
+unsafe fn text_box(prompt: &str, initial: &str, selected: usize, at: POINT) -> Option<String> {
     let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForSystem() as f32 / 96.0;
-    let edit = CreateWindowExW(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-        class.as_ptr(),
-        text.as_ptr(),
-        WS_POPUP | WS_BORDER | ES_AUTOHSCROLL_STYLE,
-        at.x,
-        at.y,
-        (380.0 * dpi) as i32,
-        (28.0 * dpi) as i32,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        GetModuleHandleW(std::ptr::null()),
-        std::ptr::null(),
-    );
-    if edit.is_null() {
-        return;
+    let px = |v: f32| (v * dpi) as i32;
+    let frame_class = wide("RivuletAsk");
+    let instance = GetModuleHandleW(std::ptr::null());
+    let mut wc: WNDCLASSW = std::mem::zeroed();
+    wc.lpfnWndProc = Some(DefWindowProcW);
+    wc.hInstance = instance;
+    wc.lpszClassName = frame_class.as_ptr();
+    wc.hbrBackground = (5 + 1) as _; // the window colour
+    RegisterClassW(&wc);
+    let title = wide(prompt);
+    let frame = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, frame_class.as_ptr(), title.as_ptr(), WS_POPUP | WS_CAPTION | WS_SYSMENU, at.x, at.y, px(420.0), px(66.0), std::ptr::null_mut(), std::ptr::null_mut(), instance, std::ptr::null());
+    if frame.is_null() {
+        return None;
     }
+    let (edit_class, text) = (wide("EDIT"), wide(initial));
+    const ES_AUTOHSCROLL_STYLE: u32 = 0x0080;
+    let edit = CreateWindowExW(0, edit_class.as_ptr(), text.as_ptr(), WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL_STYLE, px(4.0), px(4.0), px(404.0), px(26.0), frame, std::ptr::null_mut(), instance, std::ptr::null());
     let face = wide("Segoe UI");
     let font = CreateFontW(-((12.0 * dpi).round() as i32), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr());
     SendMessageW(edit, WM_SETFONT, if font.is_null() { GetStockObject(DEFAULT_GUI_FONT) as usize } else { font as usize }, 1);
-    ShowWindow(edit, SW_SHOW);
-    to_front(edit);
+    ShowWindow(frame, SW_SHOW);
+    to_front(frame);
     SetFocus(edit);
-    SendMessageW(edit, EM_SETSEL_MSG, 0, stem_length(&old) as isize);
-    SetTimer(edit, 1, 150, None); // wakes the loop below, to notice a click elsewhere
+    SendMessageW(edit, EM_SETSEL_MSG, 0, selected as isize);
+    SetTimer(frame, 1, 150, None); // wakes the loop below, to notice a click elsewhere
     let mut commit = false;
     let mut msg = std::mem::zeroed();
     while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
@@ -537,33 +531,105 @@ unsafe fn rename_box(path: &Path, at: POINT) {
         if msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE as usize {
             break;
         }
-        if GetForegroundWindow() != edit || GetFocus() != edit {
+        if GetForegroundWindow() != frame || IsWindow(frame) == 0 {
             break;
         }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    let mut answer = None;
     if commit {
         let mut buf = [0u16; 512];
         let n = GetWindowTextW(edit, buf.as_mut_ptr(), 512).max(0) as usize;
-        let new = String::from_utf16_lossy(&buf[..n]).trim().to_string();
-        if new != old {
-            if !valid_name(&new) {
-                crate::alert("That name is not allowed. A file name cannot be empty, end in a dot, or contain \\ / : * ? \" < > |");
-            } else if let Some(parent) = path.parent() {
-                let target = parent.join(&new);
-                let same_file = target.to_string_lossy().eq_ignore_ascii_case(&path.to_string_lossy());
-                if target.exists() && !same_file {
-                    crate::alert("Something with that name already exists.");
-                } else if let Err(e) = std::fs::rename(path, &target) {
-                    crate::alert(&format!("Could not rename: {e}"));
-                }
-            }
-        }
+        answer = Some(String::from_utf16_lossy(&buf[..n]).trim().to_string());
     }
-    DestroyWindow(edit);
+    DestroyWindow(frame);
     if !font.is_null() {
         DeleteObject(font as _);
+    }
+    answer
+}
+
+/// Ask for some text on a thread of its own; the answer goes to the worker.
+pub fn ask(question: crate::Ask, prompt: &'static str, initial: String) {
+    std::thread::spawn(move || unsafe {
+        let _ = OleInitialize(None);
+        let mut at = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut at);
+        if let Some(answer) = text_box(prompt, &initial, initial.encode_utf16().count(), at) {
+            crate::send(crate::Command::Answered(question, answer));
+        }
+    });
+}
+
+/// Windows' colour chooser; the choice goes to the worker as red-green-blue hex.
+pub fn pick_colour(key: String, start: u32) {
+    use windows_sys::Win32::UI::Controls::Dialogs::{ChooseColorW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW};
+    std::thread::spawn(move || unsafe {
+        let window = hidden_window();
+        to_front(window);
+        let mut custom = [0u32; 16];
+        let mut choice: CHOOSECOLORW = std::mem::zeroed();
+        choice.lStructSize = std::mem::size_of::<CHOOSECOLORW>() as u32;
+        choice.hwndOwner = window;
+        choice.rgbResult = start;
+        choice.lpCustColors = custom.as_mut_ptr();
+        choice.Flags = CC_FULLOPEN | CC_RGBINIT;
+        if ChooseColorW(&mut choice) != 0 {
+            let c = choice.rgbResult;
+            let hex = format!("{:02X}{:02X}{:02X}", c & 255, (c >> 8) & 255, (c >> 16) & 255);
+            crate::send(crate::Command::ColourChosen(key, hex));
+        }
+        DestroyWindow(window);
+    });
+}
+
+/// Windows' folder chooser; the choice goes to the worker.
+pub fn pick_folder() {
+    use windows_sys::Win32::UI::Shell::{SHBrowseForFolderW, SHGetPathFromIDListW, BROWSEINFOW};
+    std::thread::spawn(|| unsafe {
+        let _ = OleInitialize(None);
+        let window = hidden_window();
+        to_front(window);
+        let title = wide("Choose a folder to show");
+        let mut info: BROWSEINFOW = std::mem::zeroed();
+        info.hwndOwner = window;
+        info.lpszTitle = title.as_ptr();
+        const NEW_DIALOG: u32 = 0x0040;
+        const ONLY_FOLDERS: u32 = 0x0001;
+        info.ulFlags = NEW_DIALOG | ONLY_FOLDERS;
+        let item = SHBrowseForFolderW(&info);
+        if !item.is_null() {
+            let mut buf = [0u16; 1024];
+            if SHGetPathFromIDListW(item, buf.as_mut_ptr()) != 0 {
+                let n = buf.iter().position(|c| *c == 0).unwrap_or(0);
+                crate::send(crate::Command::FolderChosen(String::from_utf16_lossy(&buf[..n])));
+            }
+            CoTaskMemFree(Some(item as *const _));
+        }
+        DestroyWindow(window);
+    });
+}
+
+unsafe fn rename_box(path: &Path, at: POINT) {
+    let Some(old) = path.file_name().map(|n| n.to_string_lossy().to_string()) else { return };
+    if path.to_string_lossy().starts_with("shell:") {
+        return;
+    }
+    let Some(new) = text_box("Rename", &old, stem_length(&old), at) else { return };
+    if new == old {
+        return;
+    }
+    if !valid_name(&new) {
+        crate::alert("That name is not allowed. A file name cannot be empty, end in a dot, or contain \\ / : * ? \" < > |");
+    } else if let Some(parent) = path.parent() {
+        let target = parent.join(&new);
+        let same_file = target.to_string_lossy().eq_ignore_ascii_case(&path.to_string_lossy());
+        if target.exists() && !same_file {
+            crate::alert("Something with that name already exists.");
+        } else if let Err(e) = std::fs::rename(path, &target) {
+            crate::alert(&format!("Could not rename: {e}"));
+        }
     }
 }
 
