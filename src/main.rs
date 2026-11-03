@@ -1380,6 +1380,7 @@ impl Sections {
     unsafe fn close_open(&mut self, plan: &Plan, animate: bool) {
         let previous = self.open.take();
         *HOVER_SECTION.lock().unwrap() = None;
+        *OPENED_BY_HOVER.lock().unwrap() = None;
         self.selected.clear();
         self.anchor = -1;
         layers::SELECTED_ITEMS.lock().unwrap().clear();
@@ -1481,6 +1482,14 @@ impl Sections {
         }
         let _ = std::fs::write(open_file(), self.open.as_deref().unwrap_or(""));
         self.settle()
+    }
+
+    /// A file was opened from a section that opened by hover: let it fold when the mouse leaves.
+    fn back_to_hover(&self) {
+        let by_hover = OPENED_BY_HOVER.lock().unwrap().clone();
+        if by_hover.is_some() && by_hover == self.open {
+            *HOVER_SECTION.lock().unwrap() = by_hover;
+        }
     }
 
     /// Close with no folding away, for when the mouse has simply left.
@@ -1768,6 +1777,7 @@ impl Sections {
                 for path in &paths {
                     open_path(path);
                 }
+                self.back_to_hover();
             }
             VK_ESCAPE => {
                 if paths.is_empty() {
@@ -1860,6 +1870,7 @@ impl Sections {
                         Some(section) if path.is_dir() => self.navigate(&section, path),
                         _ => {
                             open_path(&path);
+                            self.back_to_hover();
                             if layers::peeking() {
                                 self.end_peek();
                             }
@@ -2116,7 +2127,8 @@ fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Com
                         Ok(())
                     } else {
                         let opened = s.toggle(name.clone());
-                        *HOVER_SECTION.lock().unwrap() = Some(name);
+                        *HOVER_SECTION.lock().unwrap() = Some(name.clone());
+                        *OPENED_BY_HOVER.lock().unwrap() = Some(name);
                         opened
                     }
                 }
@@ -2224,6 +2236,9 @@ static HOVER_OPENS: AtomicBool = AtomicBool::new(false);
 /// The section open only because the mouse rested on its label. It closes when the mouse leaves,
 /// and a click on its label or inside it makes it stay.
 static HOVER_SECTION: Mutex<Option<String>> = Mutex::new(None);
+/// The section that opened by resting on its label and was not since made to stay by a click on
+/// its label; opening a file from it hands it back to hover, so it folds once the mouse leaves.
+static OPENED_BY_HOVER: Mutex<Option<String>> = Mutex::new(None);
 static LEAVING: AtomicBool = AtomicBool::new(false);
 static FADE_NUDGED: AtomicBool = AtomicBool::new(false);
 static PEEK_SHORTCUT: AtomicBool = AtomicBool::new(false);
@@ -2332,6 +2347,9 @@ unsafe fn left_down(pt: POINT) -> bool {
     let hover_section = HOVER_SECTION.try_lock().ok().and_then(|mut h| h.take());
     if let Some(name) = label_at(pt) {
         if hover_section.as_deref() == Some(name.as_str()) {
+            if let Ok(mut o) = OPENED_BY_HOVER.try_lock() {
+                *o = None;
+            }
             return true; // it opened by resting on it; this click keeps it open rather than closing it
         }
         let mut last = LAST_TOGGLE.lock().unwrap();
