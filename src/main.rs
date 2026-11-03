@@ -852,6 +852,10 @@ struct Sections {
     main_window: usize,
     icons: HashMap<PathBuf, (u64, isize)>,
     last_file_click: Option<(Instant, PathBuf)>,
+    /// While a hover-opened section folds: its rail, label and full panel on screen, to see the mouse come back.
+    fold_watch: Option<(RECT, RECT, RECT)>,
+    /// The fold was cut short because the mouse came back; how far open it still was.
+    fold_back: Option<f32>,
     selected: Vec<PathBuf>,
     /// Where a Shift press measures from.
     anchor: i32,
@@ -934,12 +938,17 @@ impl Sections {
     }
 
     unsafe fn draw_open(&self, plan: &Plan, at: usize, r: Rect, reach: f32) {
+        self.draw_open_from(plan, plan.pill_mid(at), r, reach);
+    }
+
+    /// The panel at `r`, its neck starting from the rail at height `pill_y`.
+    unsafe fn draw_open_from(&self, plan: &Plan, pill_y: i32, r: Rect, reach: f32) {
         let m = plan.m;
         let (lx, ly) = plan.layer_origin;
         layers::set_panel(lx + r.x, ly + r.y, r.w, r.h, m.radius.min(r.h / 2).min(r.w / 2));
         // from the rail's inner edge to the facing edge of the panel, on either side of the screen
         let (start_x, end_x) = if plan.cfg.right_side { (plan.rail_x() + 2, r.x + r.w - 2) } else { (plan.rail_x() + m.rail_w - 2, r.x + 2) };
-        let start = (lx + start_x, ly + plan.pill_mid(at));
+        let start = (lx + start_x, ly + pill_y);
         let end = (lx + end_x, ly + r.y + (r.h / 2).min((46.0 * m.dpi) as i32));
         // liquid pours out thick and thins as it finishes
         let style = plan.cfg.style.as_str();
@@ -1291,7 +1300,7 @@ impl Sections {
     }
 
     /// Run one open (forward) or close (backward) of a section.
-    unsafe fn flow(&mut self, plan: &Plan, at: usize, opening: bool) {
+    unsafe fn flow(&mut self, plan: &Plan, at: usize, opening: bool, start: f32) {
         let Some((full, across)) = plan.panel(at) else { return };
         // Rivulet draws its own icons as part of the panel, so Explorer's stay parked
         let icons = if plan.cfg.own_icons { vec![] } else { plan.groups[at].1.clone() };
@@ -1316,7 +1325,7 @@ impl Sections {
             self.park(&icons, parked); // leaving: icons go at once, and the panel folds up after them
         }
         let mut placed = vec![parked; icons.len()];
-        let began = Instant::now();
+        let began = Instant::now() - Duration::from_secs_f32(start * seconds);
         loop {
             let t = if seconds > 0.0 { (began.elapsed().as_secs_f32() / seconds).min(1.0) } else { 1.0 };
             let progress = if opening { t } else { 1.0 - t };
@@ -1329,6 +1338,19 @@ impl Sections {
             let x = if right { full.x + full.w - w } else { full.x };
             let r = Rect { x, y: mix(seed.y, full.y, shape_h), w, h: mix(seed.h, full.h, shape_h) };
             self.draw_open(plan, at, r, ease_out((progress * 2.2).min(1.0)));
+            if let (false, Some((rail, label, panel))) = (opening, self.fold_watch) {
+                let mut pt = POINT { x: 0, y: 0 };
+                GetCursorPos(&mut pt);
+                if label_at(pt).is_some_and(|n| n != plan.groups[at].0) {
+                    break; // on to another section: this one goes now, the next opens without waiting
+                }
+                if keeps_open(pt, rail, label, panel) {
+                    // back again: open from the size it has reached, on the opening curve
+                    let size = ease_out(progress);
+                    self.fold_back = Some((0..=100).map(|i| i as f32 / 100.0).find(|&t| spring(t) >= size).unwrap_or(1.0));
+                    break;
+                }
+            }
             if opening {
                 let wanted: Vec<(i32, i32)> = (0..icons.len() as i32)
                     .map(|n| {
@@ -1394,11 +1416,13 @@ impl Sections {
                 self.sync_settings(plan);
             }
             if animate {
-                self.flow(plan, at, false);
+                self.flow(plan, at, false, 0.0);
             } else {
                 self.park(&plan.groups[at].1, (self.far(), plan.view_origin.1));
             }
-            layers::hide_panel();
+            if self.fold_back.is_none() {
+                layers::hide_panel();
+            }
         }
     }
 
@@ -1466,7 +1490,20 @@ impl Sections {
         }
         let plan = self.current_plan()?;
         let previous = self.open.clone();
-        self.close_open(&plan, previous.as_deref() == Some(name.as_str()));
+        // ponytail: slides only when Rivulet draws the icons; Explorer's icons would need moving frame by frame too
+        let slide_from = previous.as_deref().filter(|p| *p != name && plan.cfg.own_icons && !layers::peeking()).and_then(|p| plan.index(p)).filter(|_| plan.index(&name).is_some());
+        if slide_from.is_some() {
+            // as for a close, but the panel stays up to glide to its new place
+            *HOVER_SECTION.lock().unwrap() = None;
+            *OPENED_BY_HOVER.lock().unwrap() = None;
+            self.selected.clear();
+            self.anchor = -1;
+            layers::SELECTED_ITEMS.lock().unwrap().clear();
+            layers::HOVER_ITEM.store(-1, Ordering::Relaxed);
+            self.open = None;
+        } else {
+            self.close_open(&plan, previous.as_deref() == Some(name.as_str()));
+        }
         if previous.as_deref() != Some(name.as_str()) {
             if let Some(at) = plan.index(&name) {
                 if name == SETTINGS {
@@ -1475,13 +1512,48 @@ impl Sections {
                     self.last_section = Some(name.clone());
                 }
                 self.open = Some(name);
-                self.show_rail(&plan);
-                self.sync_settings(&plan);
-                self.flow(&plan, at, true);
+                match slide_from {
+                    Some(from) => self.slide(&plan, from, at),
+                    None => {
+                        self.show_rail(&plan);
+                        self.sync_settings(&plan);
+                        self.flow(&plan, at, true, 0.0);
+                    }
+                }
             }
         }
         let _ = std::fs::write(open_file(), self.open.as_deref().unwrap_or(""));
         self.settle()
+    }
+
+    /// Move straight from one open section to another: the panel glides and reshapes from the old
+    /// place to the new, and its neck slides along the rail between the two labels.
+    unsafe fn slide(&mut self, plan: &Plan, from: usize, to: usize) {
+        let (Some((old, _)), Some((new, _))) = (plan.panel(from), plan.panel(to)) else { return };
+        let (from_y, to_y) = (plan.pill_mid(from), plan.pill_mid(to));
+        let (from_colour, to_colour) = (plan.colour(&plan.groups[from].0), plan.colour(&plan.groups[to].0));
+        let liquid = matches!(plan.cfg.style.as_str(), "liquid" | "aurora" | "neon");
+        let seconds = speed_times(&plan.cfg.speed).0;
+        // the new files show at once; the panel carries them to their place
+        self.show_rail(plan);
+        self.sync_settings(plan);
+        let began = Instant::now();
+        loop {
+            let t = if seconds > 0.0 { (began.elapsed().as_secs_f32() / seconds).min(1.0) } else { 1.0 };
+            let glide = t * t * (3.0 - 2.0 * t);
+            // liquid arrives with a wobble, width and height settling out of step
+            let (shape_w, shape_h) = if liquid && t < 1.0 { jelly(t) } else { (glide, glide) };
+            let r = Rect { x: mix(old.x, new.x, glide), y: mix(old.y, new.y, glide), w: mix(old.w, new.w, shape_w), h: mix(old.h, new.h, shape_h) };
+            let r = if plan.cfg.right_side { Rect { x: mix(old.x + old.w, new.x + new.w, glide) - r.w, ..r } } else { r };
+            layers::set_accent(blend(from_colour, to_colour, glide));
+            self.draw_open_from(plan, mix(from_y, to_y, glide), r, 1.0);
+            if t >= 1.0 {
+                break;
+            }
+            if DwmFlush() != 0 {
+                std::thread::sleep(Duration::from_millis(8)); // no composition, so pace by hand
+            }
+        }
     }
 
     /// A file was opened from a section that opened by hover: let it fold when the mouse leaves.
@@ -1490,6 +1562,37 @@ impl Sections {
         if by_hover.is_some() && by_hover == self.open {
             *HOVER_SECTION.lock().unwrap() = by_hover;
         }
+    }
+
+    /// The mouse has left a section that opened by resting on its label: fold it away, and open it
+    /// again if the mouse comes back before the fold is done.
+    unsafe fn hover_fold(&mut self) -> Result<(), String> {
+        let plan = self.current_plan()?;
+        let Some(name) = self.open.clone() else { return Ok(()) };
+        let (Some(at), Some(panel)) = (plan.index(&name), *PANEL_ON_SCREEN.lock().unwrap()) else { return self.close_at_once() };
+        let (rail, label) = {
+            let labels = LABELS.lock().unwrap();
+            let Some(label) = labels.iter().find(|l| l.name == name).map(|l| l.rect) else { drop(labels); return self.close_at_once() };
+            let mut rail = label;
+            for l in labels.iter() {
+                rail.top = rail.top.min(l.rect.top);
+                rail.bottom = rail.bottom.max(l.rect.bottom);
+            }
+            (rail, label)
+        };
+        self.fold_watch = Some((rail, label, panel));
+        self.close_open(&plan, true);
+        self.fold_watch = None;
+        if let Some(start) = self.fold_back.take() {
+            self.open = Some(name.clone());
+            *HOVER_SECTION.lock().unwrap() = Some(name.clone());
+            *OPENED_BY_HOVER.lock().unwrap() = Some(name);
+            self.show_rail(&plan);
+            self.sync_settings(&plan);
+            self.flow(&plan, at, true, start);
+        }
+        let _ = std::fs::write(open_file(), self.open.as_deref().unwrap_or(""));
+        self.settle()
     }
 
     /// Close with no folding away, for when the mouse has simply left.
@@ -2052,7 +2155,7 @@ unsafe fn restore_spacing(desk: &Desktop) {
 fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Command>, window: usize) {
     unsafe {
         let last_section = open.clone();
-        let mut s = Sections { desk, open, hover: None, hidden: vec![], count: 0, seen: None, last_plan: None, last_section, shortcut_showing: false, rail_hidden: false, login: login_is_on(), tinted_for: String::from("\0"), main_window: window, icons: HashMap::new(), last_file_click: None, selected: vec![], anchor: -1, scroll: HashMap::new(), nav: HashMap::new(), query: String::new(), find_from: None, screens_seen: String::new(), last_near: Instant::now(), faded: false };
+        let mut s = Sections { desk, open, hover: None, hidden: vec![], count: 0, seen: None, last_plan: None, last_section, shortcut_showing: false, rail_hidden: false, login: login_is_on(), tinted_for: String::from("\0"), main_window: window, icons: HashMap::new(), last_file_click: None, fold_watch: None, fold_back: None, selected: vec![], anchor: -1, scroll: HashMap::new(), nav: HashMap::new(), query: String::new(), find_from: None, screens_seen: String::new(), last_near: Instant::now(), faded: false };
         CoInitializeEx(std::ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32); // file icons and opening files ask for it
         if let Err(e) = s.settle() {
             log(&format!("first sort failed: {e}"));
@@ -2138,7 +2241,7 @@ fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Com
                     let pinned = s.open.as_ref().is_some_and(|o| s.last_plan.as_ref().is_some_and(|p| p.cfg.pinned.contains(o)));
                     let still = HOVER_SECTION.lock().unwrap().is_some() && HOVER_SECTION.lock().unwrap().as_deref() == s.open.as_deref();
                     if still && !pinned && !shellmenu::SHELL_BUSY.load(Ordering::Relaxed) && !layers::peeking() {
-                        s.close_at_once()
+                        s.hover_fold()
                     } else {
                         Ok(())
                     }
@@ -2427,7 +2530,17 @@ fn has_left_hover_section(pt: POINT) -> bool {
 
 fn mouse_moved(pt: POINT) {
     if has_left_hover_section(pt) && !LEAVING.swap(true, Ordering::Relaxed) {
-        send(Command::HoverClose);
+        // a short grace, so slipping out for a moment or cutting a corner does not close it
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(200));
+            let mut now = POINT { x: 0, y: 0 };
+            unsafe { GetCursorPos(&mut now) };
+            if has_left_hover_section(now) {
+                send(Command::HoverClose);
+            } else {
+                LEAVING.store(false, Ordering::Relaxed);
+            }
+        });
     }
     if FADE_ON.load(Ordering::Relaxed) {
         // near the labels counts as using them; asked only now and then, as this is the mouse hook
