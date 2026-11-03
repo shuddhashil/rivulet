@@ -31,7 +31,7 @@ pub fn picture_path() -> Option<PathBuf> {
     copy.exists().then_some(copy)
 }
 
-unsafe fn read_setting(key: &str, name: &str) -> Option<String> {
+pub unsafe fn read_setting(key: &str, name: &str) -> Option<String> {
     let mut buffer = [0u16; 64];
     let mut size = 128u32;
     let done = RegGetValueW(HKEY_CURRENT_USER, wide(key).as_ptr(), wide(name).as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(), buffer.as_mut_ptr() as _, &mut size);

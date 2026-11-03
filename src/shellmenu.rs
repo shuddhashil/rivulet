@@ -77,6 +77,27 @@ unsafe fn parse(path: &Path) -> Option<*mut ITEMIDLIST> {
     Some(item)
 }
 
+const BIN_ICON_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\CLSID\{645FF040-5081-101B-9F08-00AA002F954E}\DefaultIcon";
+
+/// Where Windows says the Recycle Bin's picture is right now: it switches this between the empty and
+/// the full one itself, which the shell's cached pictures do not always follow.
+pub fn recycle_bin_icon_place() -> Option<String> {
+    unsafe { crate::wallpaper::read_setting(BIN_ICON_KEY, "") }
+}
+
+/// The Recycle Bin's current picture at exactly this many pixels.
+pub unsafe fn recycle_bin_icon(side: i32) -> isize {
+    use windows_sys::Win32::UI::Shell::SHDefExtractIconW;
+    let Some(place) = recycle_bin_icon_place() else { return 0 };
+    let Some((file, index)) = place.rsplit_once(',') else { return 0 };
+    let Ok(index) = index.trim().parse::<i32>() else { return 0 };
+    let mut icon = std::ptr::null_mut();
+    if SHDefExtractIconW(wide(file.trim()).as_ptr(), index, 0, &mut icon, std::ptr::null_mut(), side as u32) != 0 {
+        return 0;
+    }
+    icon as isize
+}
+
 /// The icon of something with no ordinary path, such as the Recycle Bin.
 pub unsafe fn shell_icon(path: &Path) -> isize {
     let Some(item) = parse(path) else { return 0 };
@@ -479,6 +500,70 @@ unsafe fn run_drag(paths: &[PathBuf]) {
     DestroyWindow(catcher);
 }
 
+/// Let files go onto a folder, the Recycle Bin or an app, as if dropped there in Explorer: Windows'
+/// own drop handler for that item decides (move, delete, open with) and asks about any clash.
+pub fn drop_on(paths: Vec<PathBuf>, target: PathBuf) {
+    use windows::Win32::Foundation::POINTL;
+    use windows::Win32::System::Ole::{IDropTarget, DROPEFFECT, DROPEFFECT_NONE};
+    use windows::Win32::UI::Shell::IDataObjectAsyncCapability;
+    use windows::Win32::System::SystemServices::{MK_CONTROL, MK_LBUTTON, MK_SHIFT, MODIFIERKEYS_FLAGS};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_SHIFT};
+    if SHELL_BUSY.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    std::thread::spawn(move || unsafe {
+        let _ = OleInitialize(None);
+        let hwnd = hidden_window();
+        let mut keys = MK_LBUTTON.0;
+        if GetAsyncKeyState(VK_CONTROL as i32) < 0 {
+            keys |= MK_CONTROL.0; // copy, as in Explorer
+        }
+        if GetAsyncKeyState(VK_SHIFT as i32) < 0 {
+            keys |= MK_SHIFT.0; // move, as in Explorer
+        }
+        let mut at = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut at);
+        let pt = POINTL { x: at.x, y: at.y };
+        let data = ui_object::<IDataObject>(&paths, hwnd);
+        if let (Some(data), Some(target)) = (&data, ui_object::<IDropTarget>(&[target], hwnd)) {
+            let all = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
+            let mut effect: DROPEFFECT = all;
+            let entered = target.DragEnter(data, MODIFIERKEYS_FLAGS(keys), pt, &mut effect).is_ok();
+            effect = all;
+            if entered && target.DragOver(MODIFIERKEYS_FLAGS(keys), pt, &mut effect).is_ok() && effect != DROPEFFECT_NONE {
+                // the button is up by now, as it is when Explorer drops
+                let _ = target.Drop(data, MODIFIERKEYS_FLAGS(keys & !MK_LBUTTON.0), pt, &mut effect);
+            } else if entered {
+                let _ = target.DragLeave();
+            }
+        }
+        SHELL_BUSY.store(false, Ordering::Relaxed);
+        // a move or copy may carry on in the background, with its progress and "replace or skip"
+        // boxes owned by this window: keep it until Windows says the work is done
+        // the dropped files live in this thread, so it stays while Windows' worker still holds them;
+        // the async flag alone is not enough, as Explorer's file data does not always report it
+        let held_elsewhere = |d: &IDataObject| {
+            let raw = d.as_raw();
+            let table = *(raw as *const *const windows::core::IUnknown_Vtbl);
+            ((*table).AddRef)(raw);
+            ((*table).Release)(raw) > 1
+        };
+        let working = || data.as_ref().is_some_and(|d| held_elsewhere(d) || d.cast::<IDataObjectAsyncCapability>().ok().and_then(|a| a.InOperation().ok()).is_some_and(|b| b.as_bool()));
+        let began = std::time::Instant::now();
+        let mut msg = std::mem::zeroed();
+        while began.elapsed().as_secs() < 2 || working() {
+            if PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        DestroyWindow(hwnd);
+        crate::send(crate::Command::Retidy);
+    });
+}
+
 /// A file name Windows would accept.
 pub fn valid_name(name: &str) -> bool {
     let name = name.trim();
@@ -648,6 +733,14 @@ mod tests {
         over_pixels(&mut clear, &[50, 50, 50, 128]); // over nothing it keeps its own colour
         assert_eq!(clear[3], 128);
         assert_eq!(clear[0], 99);
+    }
+
+    #[test]
+    #[ignore] // needs a real desktop
+    fn the_recycle_bin_picture_comes_from_where_windows_points() {
+        let place = recycle_bin_icon_place().expect("Windows names the bin's picture");
+        assert!(place.contains(','), "{place}");
+        assert_ne!(unsafe { recycle_bin_icon(48) }, 0);
     }
 
     #[test]

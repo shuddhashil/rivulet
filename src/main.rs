@@ -318,6 +318,21 @@ fn grid_off() -> Result<(), String> {
 
 // ---------- which file is each icon? ----------
 
+/// When files last came, went or were renamed in the desktop folders, as one number.
+unsafe fn desktop_dirs_stamp() -> u64 {
+    desktop_dirs().iter().fold(0, |sum, d| sum.wrapping_mul(31).wrapping_add(stamp(d)))
+}
+
+/// Explorer sometimes misses a folder's change notices and its desktop stops showing new files
+/// (seen 2026-11-03). Asking it to read the folders again brings them back.
+unsafe fn nudge_explorer() {
+    use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNE_UPDATEDIR, SHCNF_PATHW};
+    for dir in desktop_dirs() {
+        SHChangeNotify(SHCNE_UPDATEDIR as i32, SHCNF_PATHW, wide(&dir.to_string_lossy()).as_ptr() as _, std::ptr::null());
+    }
+    log("desktop folders changed but Explorer's list did not; asked it to look again");
+}
+
 unsafe fn desktop_dirs() -> Vec<PathBuf> {
     let mut out = vec![];
     for csidl in [0x10, 0x19] {
@@ -491,8 +506,26 @@ fn read_portal(folder: PathBuf, sort: &str) -> Option<Portal> {
 }
 
 /// A file's icon, made again if the file has changed since, so a thumbnail is never out of date.
+/// The Recycle Bin, by its folder name or by the code Windows lists it under on the desktop.
+fn is_recycle_bin(path: &Path) -> bool {
+    let p = path.to_string_lossy().to_ascii_lowercase();
+    p == "shell:recyclebinfolder" || p.contains("645ff040-5081-101b-9f08-00aa002f954e")
+}
+
+/// What says an icon may have changed: a file's date, or for the Recycle Bin, which has no date of
+/// its own, which picture Windows has it showing, empty or full.
+unsafe fn icon_stamp(path: &Path) -> u64 {
+    if !is_recycle_bin(path) {
+        return stamp(path);
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    shellmenu::recycle_bin_icon_place().hash(&mut h);
+    h.finish() >> 12 // leaves room for the size mixed in above it
+}
+
 unsafe fn cached_icon(icons: &mut HashMap<PathBuf, (u64, isize)>, path: &Path, side: i32) -> isize {
-    let changed = stamp(path) ^ ((side as u64) << 52); // a new icon size is a change too
+    let changed = icon_stamp(path) ^ ((side as u64) << 52); // a new icon size is a change too
     if let Some(&(when, icon)) = icons.get(path) {
         if when == changed {
             return icon;
@@ -505,6 +538,12 @@ unsafe fn cached_icon(icons: &mut HashMap<PathBuf, (u64, isize)>, path: &Path, s
 }
 
 unsafe fn file_icon(path: &Path, side: i32) -> isize {
+    if is_recycle_bin(path) {
+        let bin = shellmenu::recycle_bin_icon(side);
+        if bin != 0 {
+            return bin;
+        }
+    }
     let sharp = shellmenu::sharp_icon(path, side); // the size the panel draws it, so nothing is stretched
     if sharp != 0 {
         return sharp;
@@ -827,6 +866,8 @@ enum Command {
     Changed,
     Light,
     Retidy,
+    /// Files carried in a drag were let go over the panel item with this index.
+    DropOn(Vec<PathBuf>, i32),
     Stop,
 }
 
@@ -1004,6 +1045,14 @@ impl Sections {
     unsafe fn file_panel(&mut self, plan: &Plan, at: usize, name: &str, mut grid: settings::Grid) -> Vec<settings::Item> {
         let m = plan.m;
         let side = if grid.list { settings::list_icon_pixels(m.dpi) } else { settings::icon_pixels(m.dpi) };
+        // icons of files since deleted or renamed go, or over weeks they use up Windows' picture handles
+        self.icons.retain(|path, (_, icon)| {
+            let keep = path.to_string_lossy().starts_with("shell:") || path.exists();
+            if !keep {
+                DestroyIcon(*icon as HICON);
+            }
+            keep
+        });
         let mut entries: Vec<(Option<PathBuf>, String)> = match plan.portals.get(name) {
             Some(portal) => portal.files.iter().map(|(p, f)| (Some(p.clone()), f.clone())).collect(),
             None => plan.groups[at].1.iter().map(|&i| (plan.paths.get(i).cloned().flatten(), plan.labels[i].clone())).collect(),
@@ -2165,6 +2214,8 @@ fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Com
         }
         log("running");
         let mut last_check = Instant::now();
+        // to see the folders change while Explorer's list does not
+        let (mut dirs_before, mut count_before, mut waiting) = (desktop_dirs_stamp(), s.desk.count(), None);
         loop {
             // Aurora's colours drift about 25 times a second, and only while it is worth seeing
             let wait = if pretty::drifting() { Duration::from_millis(33) } else { CHECK_EVERY };
@@ -2275,6 +2326,16 @@ fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Com
                     s.settle()
                 }
                 Ok(Command::Retidy) => s.settle(),
+                Ok(Command::DropOn(paths, n)) => {
+                    let target = layers::SETTINGS_ITEMS.lock().unwrap().get(n as usize).and_then(|i| match &i.action {
+                        Some(Action::Open(p)) => Some(p.clone()),
+                        _ => None,
+                    });
+                    if let Some(target) = target.filter(|t| !paths.contains(t)) {
+                        shellmenu::drop_on(paths, target);
+                    }
+                    Ok(())
+                }
                 Ok(Command::Light) => {
                     let mut pt = POINT { x: 0, y: 0 };
                     GetCursorPos(&mut pt);
@@ -2301,6 +2362,15 @@ fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Com
                     }
                     if last_check.elapsed() >= CHECK_EVERY {
                         last_check = Instant::now();
+                        let (dirs, count) = (desktop_dirs_stamp(), s.desk.count());
+                        if let Some(stuck) = waiting.take() {
+                            if count == stuck {
+                                nudge_explorer(); // still nothing a whole check later
+                            }
+                        } else if dirs != dirs_before && count == count_before {
+                            waiting = Some(count); // Explorer usually follows within a second; give it one more check
+                        }
+                        (dirs_before, count_before) = (dirs, count);
                         if s.needs_settle() {
                             s.settle()
                         } else {
@@ -2535,7 +2605,14 @@ fn mouse_moved(pt: POINT) {
             std::thread::sleep(Duration::from_millis(200));
             let mut now = POINT { x: 0, y: 0 };
             unsafe { GetCursorPos(&mut now) };
-            if has_left_hover_section(now) {
+            // a busy lock reads as "not left"; ask again shortly, as the mouse may not move again
+            let left = (0..5).any(|try_no| {
+                if try_no > 0 {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                has_left_hover_section(now)
+            });
+            if left {
                 send(Command::HoverClose);
             } else {
                 LEAVING.store(false, Ordering::Relaxed);
@@ -2574,12 +2651,14 @@ fn mouse_moved(pt: POINT) {
     if let Ok(mut hovering) = HOVERING.try_lock() {
         if *hovering != hit {
             *hovering = hit.clone();
-            if let Some(name) = hit.clone().filter(|n| HOVER_OPENS.load(Ordering::Relaxed) && n != SETTINGS) {
-                // only if the mouse is still resting there, and is not carrying files to file there
+            let carrying = ghost::dragging();
+            if let Some(name) = hit.clone().filter(|n| (carrying || HOVER_OPENS.load(Ordering::Relaxed)) && n != SETTINGS) {
+                // only if the mouse is still resting there; carrying files it waits longer, so a quick
+                // drop on the label still files them there, and resting opens it to drop inside
                 std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(350));
+                    std::thread::sleep(Duration::from_millis(if carrying { 600 } else { 350 }));
                     let same = HOVERING.lock().is_ok_and(|h| h.as_deref() == Some(name.as_str()));
-                    if same && !ghost::dragging() {
+                    if same && ghost::dragging() == carrying {
                         send(Command::HoverOpen(name));
                     }
                 });
@@ -2622,13 +2701,15 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 if SWALLOW_RELEASE.swap(false, Ordering::Relaxed) {
                     let dragged = ghost::release();
                     box_ended();
-                    if let Some((names, _)) = DRAG_ITEMS.try_lock().ok().and_then(|mut d| d.take()) {
+                    if let Some((names, paths)) = DRAG_ITEMS.try_lock().ok().and_then(|mut d| d.take()) {
                         if !dragged {
                             if PLAIN_PRESS.load(Ordering::Relaxed) {
                                 send(Command::FileRelease(pt));
                             }
                         } else if let Some(section) = label_at(pt) {
                             send(Command::FiledItems(names, section));
+                        } else if let Some(Some((n, ..))) = file_under(pt) {
+                            send(Command::DropOn(paths, n)); // into a folder, the Recycle Bin, an app
                         }
                     }
                     return 1;
@@ -3141,6 +3222,14 @@ fn main() {
 
 #[cfg(test)]
 mod hover_tests {
+    #[test]
+    fn the_recycle_bin_is_known_by_either_name() {
+        use std::path::Path;
+        assert!(super::is_recycle_bin(Path::new("shell:RecycleBinFolder")));
+        assert!(super::is_recycle_bin(Path::new("shell:::{645FF040-5081-101B-9F08-00AA002F954E}")));
+        assert!(!super::is_recycle_bin(Path::new("shell:::{20D04FE0-3AEA-1069-A2D8-08002B30309D}")));
+    }
+
     use super::*;
 
     #[test]
