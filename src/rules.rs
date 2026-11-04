@@ -182,6 +182,7 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
         monitor_profiles: false,
     };
     let mut old_pretty = false;
+    let mut glass_given = false; // an explicit glass percentage beats the old panel = clear/normal/solid preset
     let mut style_given = false;
     let mut part = String::new();
     for line in text.lines().map(str::trim) {
@@ -270,6 +271,7 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
                 "monitor_profiles" => cfg.monitor_profiles = on_off(&key, value)?,
                 "pinned" => cfg.pinned = value.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
                 "glass" => {
+                    glass_given = true;
                     cfg.glass = value.parse().ok().filter(|v| (20..=160).contains(v)).ok_or_else(|| format!("sections.ini: glass should be 20 to 160: {line}"))?;
                 }
                 "text_colour" | "border_colour" | "tint_colour" | "panel_colour" => {
@@ -295,7 +297,7 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
                         return Err(format!("sections.ini: {key} should be one of {}: {line}", allowed.join(", ")));
                     }
                     *slot = value.to_string();
-                    if key == "panel" {
+                    if key == "panel" && !glass_given {
                         cfg.glass = match value { "clear" => 50, "solid" => 140, _ => 100 };
                     }
                 }
@@ -1081,5 +1083,17 @@ mod tests {
         assert_eq!(blend(0x000000, 0xFFFFFF, 1.0), 0xFFFFFF);
         assert_eq!(dark_shade(0x804020, 40.0), 0x28140A);
         assert_eq!(dark_shade(0, 40.0), 0);
+    }
+
+    #[test]
+    fn explicit_glass_beats_old_panel_preset() {
+        let g = |t: &str| parse_config(&format!("{INI}{t}")).unwrap().glass;
+        assert_eq!(g("[general]
+glass = 40
+panel = clear
+"), 40);
+        assert_eq!(g("[general]
+panel = clear
+"), 50);
     }
 }
