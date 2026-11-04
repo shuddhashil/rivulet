@@ -12,7 +12,7 @@ cbuffer Glass : register(b0) {
     float4 neck1;  // curve points 2 and 3
     float4 neck2;  // on, reach, half width at the ends, half width in the middle
     float4 pill;   // the label the neck comes out of
-    float4 look;   // 0 liquid, 1 aurora, 2 neon; seconds; how strongly this piece glows
+    float4 look;   // 0 liquid, 1 aurora, 2 neon, 3 clear; seconds; how strongly this piece glows
     float4 glow;   // this section's colour
     float4 fade;   // x: how visible this piece is, 0 to 1
 };
@@ -81,8 +81,10 @@ float4 glass_core(float4 position : SV_Position) : SV_Target {
     float2 p = position.xy;
     float scale = shape.w;
     float d = glass_distance(p);
+    bool neon = abs(look.x - 2) < 0.5;
+    bool clear = look.x > 2.5; // Apple's clear glass: sharp in the middle, bent and slightly soft at the rim
     if (d > 0.5) {
-        if (look.x > 1.5) {
+        if (neon) {
             // neon: light spilling out of the tube instead of a shadow
             float a = exp(-d / (5 * scale)) * saturate(1 - d / (14 * scale)) * (0.40 + 0.35 * mouse.z) * look.z;
             return float4(glow.rgb * a, a * 0.55);
@@ -96,7 +98,7 @@ float4 glass_core(float4 position : SV_Position) : SV_Target {
 
     float inside = -d;
     float cover = saturate(0.5 - d);
-    if (look.x > 1.5) {
+    if (neon) {
         // neon: dark glass, and a lit tube round the edge in the section's colour
         float3 dark = wallpaper(p + place.xy, 5.0) * 0.16 + float3(0.012, 0.012, 0.03);
         float2 to = mouse.xy - p;
@@ -111,10 +113,10 @@ float4 glass_core(float4 position : SV_Position) : SV_Target {
         return float4(saturate(lit_colour) * cover, cover) + float4(glow.rgb * a, a * 0.55) * (1 - cover);
     }
     float t = saturate(1 - inside / shape.y); // 0 inside, 1 at the very edge
-    float bend = shape.y * 1.9 * t * t * t;
+    float bend = clear ? shape.y * 2.4 * t * t : shape.y * 1.9 * t * t * t;
     float2 at = p + place.xy;
-    float aurora = look.x > 0.5 ? 1.0 : 0.0;
-    float level = shape.z + t * 1.2 + aurora * 1.6;
+    float aurora = abs(look.x - 1) < 0.5 ? 1.0 : 0.0;
+    float level = clear ? shape.z + t * t * 1.5 : shape.z + t * 1.2 + aurora * 1.6;
     // red bends least and blue most, as in a real lens
     float3 colour = float3(wallpaper(at - n * bend * 0.92, level).r,
                            wallpaper(at - n * bend, level).g,
@@ -152,7 +154,7 @@ float4 glass_core(float4 position : SV_Position) : SV_Target {
     float around = dot(picture.SampleLevel(smooth_sampler, at / place.zw, 6).rgb, float3(0.3, 0.59, 0.11));
     colour *= 1 - mouse.w * smoothstep(0.38, 0.85, max(around, grey * 0.8));
     colour = lerp(colour, tint.rgb, tint.a);
-    colour *= 1 - 0.16 * t * t;
+    colour *= 1 - (clear ? 0.05 : 0.16) * t * t;
 
     // the light comes from the top left until the mouse is near, then from the mouse
     float2 to_mouse = mouse.xy - p;

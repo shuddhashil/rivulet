@@ -335,8 +335,12 @@ pub fn apply_look(cfg: &crate::rules::Config) {
 
 /// How much a panel of files lets through, against normal being 1.
 pub fn panel_strength() -> f32 {
-    let files = SETTINGS_ITEMS.lock().is_ok_and(|i| i.iter().any(|x| matches!(x.look, Look::File(..))));
-    if files { PANEL_PERCENT.load(Ordering::Relaxed) as f32 / 100.0 } else { 1.0 }
+    if files_showing() { PANEL_PERCENT.load(Ordering::Relaxed) as f32 / 100.0 } else { 1.0 }
+}
+
+/// True when the panel holds files (own-icons mode) rather than a Settings page.
+pub fn files_showing() -> bool {
+    SETTINGS_ITEMS.lock().is_ok_and(|i| i.iter().any(|x| matches!(x.look, Look::File(..))))
 }
 
 /// How high a line of file name is, in pixels.

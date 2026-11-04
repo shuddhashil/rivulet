@@ -22,7 +22,7 @@ pub struct Config {
     pub dots: bool,
     pub click_away: bool,
     pub double_click_hide: bool,
-    /// plain, smooth, glass, liquid, aurora or neon. Anything but plain needs the graphics libraries.
+    /// plain, smooth, glass, liquid, aurora, neon or clear. Anything but plain needs the graphics libraries.
     pub style: String,
     /// Sections that show a folder: (label, folder, which may name %VARIABLES%).
     pub portals: Vec<(String, String)>,
@@ -303,8 +303,8 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
                 }
                 "pretty" => old_pretty = on_off(&key, value)?, // from before there were styles
                 "style" => {
-                    if !matches!(value, "plain" | "smooth" | "glass" | "liquid" | "aurora" | "neon") {
-                        return Err(format!("sections.ini: style should be plain, smooth, glass, liquid, aurora or neon: {line}"));
+                    if !matches!(value, "plain" | "smooth" | "glass" | "liquid" | "aurora" | "neon" | "clear") {
+                        return Err(format!("sections.ini: style should be plain, smooth, glass, liquid, aurora, neon or clear: {line}"));
                     }
                     cfg.style = value.to_string();
                     style_given = true;
@@ -820,6 +820,7 @@ mod tests {
         assert_eq!(with("style = liquid"), "liquid");
         assert_eq!(with("style = aurora"), "aurora");
         assert_eq!(with("style = neon"), "neon");
+        assert_eq!(with("style = clear"), "clear");
     }
 
     const EDITABLE: &str = "[general]\npinned = Word, PDF\n[types]\nWord = .docx\nPDF = .pdf\nNotes = .txt\nOther =\n[names]\n*x* = Word\n[layout]\ncolumn1 = Word, PDF\ncolumn2 = Notes, Other\n[colours]\nWord = 112233\n[tabs]\nDocs = Word, PDF\n";

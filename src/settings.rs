@@ -211,7 +211,7 @@ fn build_page(cfg: &Config, login: bool, dpi: f32, page: u8) -> Vec<Item> {
     b.stepper("Days to look back (0 is off)", "recent", "days", cfg.recent_days, 1, 0, 30);
     b.stepper("Most items to show", "recent", "limit", cfg.recent_limit as u64, 1, 1, 24);
     b.heading("Look");
-    b.choice("Style", "style", &["Plain", "Smooth", "Glass", "Liquid", "Aurora", "Neon"], &cfg.style);
+    b.choice("Style", "style", &["Plain", "Smooth", "Glass", "Liquid", "Clear", "Aurora", "Neon"], &cfg.style);
     let note = b.rect(MARGIN, WIDTH - 2.0 * MARGIN);
     b.add(note, Look::Note("Plain uses 2 MB; the others use far more. Leaving Plain applies at next start.".to_string()), None);
     b.row += 1;

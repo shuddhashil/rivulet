@@ -993,10 +993,10 @@ impl Sections {
         let end = (lx + end_x, ly + r.y + (r.h / 2).min((46.0 * m.dpi) as i32));
         // liquid pours out thick and thins as it finishes
         let style = plan.cfg.style.as_str();
-        let fluid = matches!(style, "liquid" | "aurora" | "neon");
+        let fluid = matches!(style, "liquid" | "aurora" | "neon" | "clear");
         let swell = if fluid { 1.0 + (1.0 - reach) * 0.9 } else { 1.0 };
         let waist = match style {
-            "liquid" | "aurora" => 16.0,
+            "liquid" | "aurora" | "clear" => 16.0,
             "neon" => 9.0, // a lit tube looks best slim
             _ => 2.5,
         };
@@ -1007,11 +1007,12 @@ impl Sections {
     /// Glass needs a fresh blurred wallpaper; the other styles don't keep one.
     fn apply_style(&self, style: &str) {
         unsafe {
-            if matches!(style, "glass" | "liquid" | "aurora" | "neon") && pretty::is_on() {
+            if matches!(style, "glass" | "liquid" | "aurora" | "neon" | "clear") && pretty::is_on() {
                 let shader_look = match style {
                     "liquid" => Some(0.0),
                     "aurora" => Some(1.0),
                     "neon" => Some(2.0),
+                    "clear" => Some(3.0),
                     _ => None,
                 };
                 if let Err(e) = pretty::load_backdrop(GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), shader_look) {
@@ -1356,7 +1357,7 @@ impl Sections {
         let m = plan.m;
         layers::set_accent(plan.colour(&plan.groups[at].0));
         let right = plan.cfg.right_side;
-        let liquid = matches!(plan.cfg.style.as_str(), "liquid" | "aurora" | "neon");
+        let liquid = matches!(plan.cfg.style.as_str(), "liquid" | "aurora" | "neon" | "clear");
         let seed = Rect { x: full.x, y: (plan.pill_mid(at) - m.pill_h / 2).clamp(m.gap, plan.room.1 - m.pill_h), w: m.pill_h, h: m.pill_h };
         let rows = (icons.len() as i32 + across - 1) / across;
         let (open_time, close_time) = speed_times(&plan.cfg.speed);
@@ -1581,7 +1582,7 @@ impl Sections {
         let (Some((old, _)), Some((new, _))) = (plan.panel(from), plan.panel(to)) else { return };
         let (from_y, to_y) = (plan.pill_mid(from), plan.pill_mid(to));
         let (from_colour, to_colour) = (plan.colour(&plan.groups[from].0), plan.colour(&plan.groups[to].0));
-        let liquid = matches!(plan.cfg.style.as_str(), "liquid" | "aurora" | "neon");
+        let liquid = matches!(plan.cfg.style.as_str(), "liquid" | "aurora" | "neon" | "clear");
         let seconds = speed_times(&plan.cfg.speed).0;
         // the new files show at once; the panel carries them to their place
         self.show_rail(plan);
