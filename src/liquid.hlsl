@@ -112,8 +112,11 @@ float4 glass_core(float4 position : SV_Position) : SV_Target {
         float a = exp(-max(d, 0) / (5 * scale)) * 0.40 * look.z;
         return float4(saturate(lit_colour) * cover, cover) + float4(glow.rgb * a, a * 0.55) * (1 - cover);
     }
-    float t = saturate(1 - inside / shape.y); // 0 inside, 1 at the very edge
-    float bend = clear ? shape.y * 2.4 * t * t : shape.y * 1.9 * t * t * t;
+    // the glass swells where the mouse is: a wider, deeper lens right under the pointer
+    float swell = mouse.z * exp(-length(mouse.xy - p) / (90 * scale));
+    float rim = shape.y * (1 + 0.35 * swell);
+    float t = saturate(1 - inside / rim); // 0 inside, 1 at the very edge
+    float bend = (clear ? rim * 2.4 * t * t : rim * 1.9 * t * t * t) * (1 + 0.5 * swell);
     float2 at = p + place.xy;
     float aurora = abs(look.x - 1) < 0.5 ? 1.0 : 0.0;
     float level = clear ? shape.z + t * t * 1.5 : shape.z + t * 1.2 + aurora * 1.6;

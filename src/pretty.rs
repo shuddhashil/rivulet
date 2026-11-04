@@ -299,6 +299,13 @@ unsafe fn fill_frosted(page: &mut Page, x: i32, y: i32, w: i32, h: i32, radius: 
     }
 }
 
+/// A corner that grows with the shape: the set corner on a small panel, up to 2.4 times it on a
+/// big one, and never more than a full round end.
+fn panel_corner(w: i32, h: i32, base: i32, dpi: f32) -> f32 {
+    let short = w.min(h) as f32;
+    (base as f32 * (short / (120.0 * dpi)).sqrt().clamp(1.0, 2.4)).min(short / 2.0)
+}
+
 /// The glass edge: near the rim, the picture is pulled inward as a thick lens would, and brightens
 /// where the curve catches the light. It fades into what is already there, so no seam shows, and
 /// it is worked out pixel by pixel, so only once a panel is at rest.
@@ -1310,7 +1317,8 @@ impl Engine {
                     };
                     let numbers = Glass {
                         box_: [(r.left + margin) as f32, (r.top + margin) as f32, (r.right - r.left) as f32, (r.bottom - r.top) as f32],
-                        shape: [14.0 * dpi, 12.0 * dpi, if clear { 0.0 } else { 2.2 }, dpi],
+                        // a hovered or open label is a thicker lens, so its edge bends more
+                        shape: [14.0 * dpi, if p.active { 16.0 } else if p.hover { 14.5 } else { 11.0 } * dpi, if clear { 0.0 } else { 2.2 }, dpi],
                         tint: card_colour(colour, strength),
                         mouse: [base.mouse[0], base.mouse[1], base.mouse[2], if clear { 0.45 } else { 0.55 }],
                         look: [base.look[0], base.look[1], if p.active { 1.0 } else if p.hover { 0.8 } else { 0.5 }, 0.0],
@@ -1357,7 +1365,7 @@ impl Engine {
                 if let Some(page) = panel.page.as_mut() {
                     page.clear();
                     let (fx, fy) = ((p.x - left) as f32, (p.y - top) as f32);
-                    let body = round_path(fx, fy, p.w as f32, p.h as f32, (p.radius * 2) as f32);
+                    let body = round_path(fx, fy, p.w as f32, p.h as f32, 2.0 * panel_corner(p.w, p.h, p.radius, dpi));
                     GdipSetClipPath(page.g, body, CombineModeReplace);
                     GdipDeletePath(body);
                     GdipTranslateWorldTransform(page.g, fx, fy, MatrixOrderPrepend);
@@ -1375,13 +1383,15 @@ impl Engine {
             // a panel of files is clear glass in the Clear style; only a real Settings page stays frosted
             let clear_files = clear && layers::files_showing();
             let tint = blend(blend(layers::panel_tint(), layers::accent(), 0.16), 0x00FFFFFF, 0.04);
-            let band = (34.0 * dpi).min(p.h as f32 / 2.0).min(p.w as f32 / 2.0);
+            // corner and lens grow with the panel, so they follow it as it pours open
+            let radius = panel_corner(p.w, p.h, p.radius, dpi);
+            let band = (p.w.min(p.h) as f32 * 0.085).clamp(12.0 * dpi, 40.0 * dpi).min(p.h as f32 / 2.0).min(p.w as f32 / 2.0);
             let pill = active.map(|r| [(rail.0 + r.left) as f32 - lf, (rail.1 + r.top) as f32 - tf, (r.right - r.left) as f32, (r.bottom - r.top) as f32]);
             let (fx, fy, tx, ty) = (n.from.0 as f32 - lf, n.from.1 as f32 - tf, n.to.0 as f32 - lf, n.to.1 as f32 - tf);
             let mid = (fx + tx) / 2.0;
             let numbers = Glass {
                 box_: [(p.x - left) as f32, (p.y - top) as f32, p.w as f32, p.h as f32],
-                shape: [p.radius as f32, band, if clear_files || (clear && !settings) { 0.0 } else if settings { 3.2 } else { 0.9 }, dpi],
+                shape: [radius, band, if clear_files || (clear && !settings) { 0.0 } else if settings { 3.2 } else { 0.9 }, dpi],
                 tint: card_colour(tint, if clear_files { 0.06 } else if settings { (if base.look[0] == 1.0 { 0.42 } else { 0.66 } * layers::panel_strength()).min(0.95) } else if clear { 0.04 } else { 0.10 }),
                 mouse: [base.mouse[0], base.mouse[1], base.mouse[2], if clear_files { 0.45 } else if settings { 0.2 } else { 0.32 }],
                 neck0: [fx, fy, mid, fy],
