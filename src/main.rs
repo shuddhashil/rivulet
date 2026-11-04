@@ -871,6 +871,30 @@ enum Command {
     Stop,
 }
 
+/// Windows rewrites its copy of the wallpaper in this folder on every change, so watching it
+/// gives the new picture at once instead of at the next 3 s check.
+fn watch_wallpaper() {
+    use windows_sys::Win32::Storage::FileSystem::{FindFirstChangeNotificationW, FindNextChangeNotification, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE};
+    let Ok(appdata) = std::env::var("APPDATA") else { return };
+    let folder = wide(&format!(r"{appdata}\Microsoft\Windows\Themes"));
+    std::thread::spawn(move || unsafe {
+        let watch = FindFirstChangeNotificationW(folder.as_ptr(), 0, FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE);
+        if watch == INVALID_HANDLE_VALUE {
+            return; // the 3 s check still catches it
+        }
+        while WaitForSingleObject(watch, INFINITE) == WAIT_OBJECT_0 {
+            // the file is still being written when the notice comes: look now, and once more after
+            for wait in [150, 600] {
+                std::thread::sleep(Duration::from_millis(wait));
+                send(Command::Retidy);
+            }
+            if FindNextChangeNotification(watch) == 0 {
+                return;
+            }
+        }
+    });
+}
+
 fn send(c: Command) {
     if let Some(tx) = COMMANDS.get() {
         let _ = tx.send(c);
@@ -1005,7 +1029,8 @@ impl Sections {
 
     /// A fixed theme, or a dark shade of the wallpaper's average colour.
     /// Glass needs a fresh blurred wallpaper; the other styles don't keep one.
-    fn apply_style(&self, style: &str) {
+    /// False when the wallpaper could not be read yet, so the next check tries again.
+    fn apply_style(&self, style: &str) -> bool {
         unsafe {
             if matches!(style, "glass" | "liquid" | "aurora" | "neon" | "clear") && pretty::is_on() {
                 let shader_look = match style {
@@ -1015,20 +1040,23 @@ impl Sections {
                     "clear" => Some(3.0),
                     _ => None,
                 };
+                log(&format!("glass picture from {:?}", wallpaper::picture_path()));
                 if let Err(e) = pretty::load_backdrop(GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), shader_look) {
                     log(&format!("glass unavailable, using the smooth look: {e}"));
                     pretty::drop_backdrop();
+                    return false;
                 }
             } else {
                 pretty::drop_backdrop();
             }
         }
+        true
     }
 
     fn apply_theme(&mut self, theme: &str, style: &str, tag: &str, panel: Option<u32>) {
-        let now = format!("{theme}|{style}|{tag}|{}|{}", wallpaper::current(), wallpaper::placement_setting());
+        let now = format!("{theme}|{style}|{tag}|{}|{}", wallpaper::placement_setting(), wallpaper::stamp());
         if now != self.tinted_for {
-            self.apply_style(style);
+            let read = self.apply_style(style);
             if let Some((pill, panel)) = theme_tints(theme) {
                 layers::set_tints(pill, panel);
             } else if let Some(average) = wallpaper::average_colour() {
@@ -1037,7 +1065,7 @@ impl Sections {
             if let Some(chosen) = panel {
                 layers::set_tints(layers::pill_tint(), chosen);
             }
-            self.tinted_for = now;
+            self.tinted_for = if read { now } else { String::from(" ") };
         }
     }
 
@@ -2159,7 +2187,7 @@ impl Sections {
 
     /// Cheap backstop check, in case Windows did not report a change.
     unsafe fn needs_settle(&self) -> bool {
-        if !self.desk.alive() || !layers::alive() || self.desk.count() != self.count || !self.tinted_for.ends_with(&wallpaper::current()) {
+        if !self.desk.alive() || !layers::alive() || self.desk.count() != self.count || !self.tinted_for.ends_with(&wallpaper::stamp()) {
             return true;
         }
         let width = self.desk.width();
@@ -3010,6 +3038,7 @@ unsafe fn run() -> Result<(), String> {
     start_pretty_if_wanted();
     let (tx, rx) = channel();
     let _ = COMMANDS.set(tx);
+    watch_wallpaper();
     let hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), instance, 0);
     if hook.is_null() {
         return Err("Windows refused to let this watch for clicks.".into());

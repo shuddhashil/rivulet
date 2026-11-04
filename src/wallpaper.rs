@@ -21,19 +21,30 @@ pub fn current() -> String {
     String::from_utf16_lossy(&buf[..n])
 }
 
-/// The picture on the desktop, even if its original file has since gone.
-pub fn picture_path() -> Option<PathBuf> {
-    let now = current();
-    if Path::new(&now).exists() {
-        return Some(PathBuf::from(now));
-    }
+/// Windows' own copy of the picture now on the desktop. It is rewritten on every change, however
+/// the wallpaper was set, so it is the one thing that is never stale.
+fn shown_copy() -> Option<PathBuf> {
     let copy = Path::new(&std::env::var("APPDATA").ok()?).join(r"Microsoft\Windows\Themes\TranscodedWallpaper");
     copy.exists().then_some(copy)
 }
 
+/// Changes whenever the wallpaper does, even when an app reuses the same path.
+pub fn stamp() -> String {
+    let copy = shown_copy().and_then(|c| std::fs::metadata(c).ok()).map(|m| (m.modified().ok(), m.len()));
+    format!("{}|{copy:?}", current())
+}
+
+/// The picture on the desktop: Windows' copy first, which matches the screen exactly.
+pub fn picture_path() -> Option<PathBuf> {
+    shown_copy().or_else(|| {
+        let now = current();
+        Path::new(&now).exists().then(|| PathBuf::from(now))
+    })
+}
+
 pub unsafe fn read_setting(key: &str, name: &str) -> Option<String> {
-    let mut buffer = [0u16; 64];
-    let mut size = 128u32;
+    let mut buffer = [0u16; 1024]; // long enough for a wallpaper path
+    let mut size = 2048u32;
     let done = RegGetValueW(HKEY_CURRENT_USER, wide(key).as_ptr(), wide(name).as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(), buffer.as_mut_ptr() as _, &mut size);
     if done != 0 {
         return None;
