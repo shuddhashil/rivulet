@@ -888,14 +888,21 @@ pub unsafe fn start(window: HWND, dpi: f32) -> Result<(), String> {
     let create_composition: CreateComposition = std::mem::transmute(system_function("dcomp.dll", b"DCompositionCreateDevice\0")?);
     let text = |e: windows::core::Error| e.to_string();
 
-    let (mut raw_device, mut raw_context) = (std::ptr::null_mut(), std::ptr::null_mut());
-    create_device(std::ptr::null_mut(), HARDWARE, std::ptr::null_mut(), BGRA_SUPPORT, std::ptr::null(), 0, SDK_VERSION, &mut raw_device, std::ptr::null_mut(), &mut raw_context).ok().map_err(text)?;
-    let device = ID3D11Device::from_raw(raw_device);
-    let context = ID3D11DeviceContext::from_raw(raw_context);
-    let dxgi: IDXGIDevice = device.cast().map_err(text)?;
     let mut raw_factory = std::ptr::null_mut();
     create_factory(0, &IDXGIFactory2::IID, &mut raw_factory).ok().map_err(text)?;
     let factory = IDXGIFactory2::from_raw(raw_factory);
+    // Draw on the low-power card. Left to Windows, a laptop picks its gaming card, whose driver
+    // costs ~30 MB more memory and keeps that card awake.
+    let quiet_card = factory.cast::<IDXGIFactory6>().ok().and_then(|f| f.EnumAdapterByGpuPreference::<IDXGIAdapter>(0, DXGI_GPU_PREFERENCE_MINIMUM_POWER).ok());
+    let (adapter, kind) = match &quiet_card {
+        Some(a) => (a.as_raw(), 0), // 0 = "the card given", as Direct3D requires with an adapter
+        None => (std::ptr::null_mut(), HARDWARE),
+    };
+    let (mut raw_device, mut raw_context) = (std::ptr::null_mut(), std::ptr::null_mut());
+    create_device(adapter, kind, std::ptr::null_mut(), BGRA_SUPPORT, std::ptr::null(), 0, SDK_VERSION, &mut raw_device, std::ptr::null_mut(), &mut raw_context).ok().map_err(text)?;
+    let device = ID3D11Device::from_raw(raw_device);
+    let context = ID3D11DeviceContext::from_raw(raw_context);
+    let dxgi: IDXGIDevice = device.cast().map_err(text)?;
     let mut raw_dcomp = std::ptr::null_mut();
     create_composition(dxgi.as_raw(), &IDCompositionDevice::IID, &mut raw_dcomp).ok().map_err(text)?;
     let dcomp = IDCompositionDevice::from_raw(raw_dcomp);
@@ -1622,6 +1629,12 @@ pub unsafe fn hide_panel() {
             let _ = e.panel.visual.SetOffsetX2(FAR_AWAY);
             let _ = e.neck.visual.SetOffsetX2(FAR_AWAY);
             let _ = e.dcomp.Commit();
+            // Hand back the driver's scratch memory from the animation; every frame sets its own state again.
+            e.context.ClearState();
+            e.context.Flush();
+            if let Ok(d) = e.device.cast::<IDXGIDevice3>() {
+                d.Trim();
+            }
         }
     }
 }
