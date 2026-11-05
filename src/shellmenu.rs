@@ -129,55 +129,6 @@ fn square_pixels(from: &[u8], w: usize, h: usize, side: usize) -> Vec<u8> {
     out
 }
 
-/// Put a premultiplied picture over straight-alpha pixels, leaving straight alpha. For shortcut arrows.
-fn over_pixels(under: &mut [u8], top: &[u8]) {
-    for (u, t) in under.chunks_exact_mut(4).zip(top.chunks_exact(4)) {
-        let (ta, ua) = (t[3] as u32, u[3] as u32);
-        let keep = ua * (255 - ta) / 255;
-        let a = ta + keep;
-        for c in 0..3 {
-            let mixed = t[c] as u32 + u[c] as u32 * keep / 255;
-            u[c] = if a == 0 { 0 } else { (mixed * 255 / a).min(255) as u8 };
-        }
-        u[3] = a as u8;
-    }
-}
-
-/// The little arrow Windows puts on a shortcut, as premultiplied pixels the size of the icon.
-unsafe fn arrow_pixels(side: i32) -> Option<Vec<u8>> {
-    use windows_sys::Win32::Graphics::Gdi::{BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DeleteDC, SelectObject, DIB_RGB_COLORS};
-    use windows_sys::Win32::UI::Shell::{SHDefExtractIconW, SHGetStockIconInfo, SHSTOCKICONINFO, SIID_LINK, SHGSI_ICONLOCATION};
-    let mut stock: SHSTOCKICONINFO = std::mem::zeroed();
-    stock.cbSize = std::mem::size_of::<SHSTOCKICONINFO>() as u32;
-    if SHGetStockIconInfo(SIID_LINK, SHGSI_ICONLOCATION, &mut stock) != 0 {
-        return None;
-    }
-    let mut arrow = std::ptr::null_mut();
-    if SHDefExtractIconW(stock.szPath.as_ptr(), stock.iIcon, 0, &mut arrow, std::ptr::null_mut(), side as u32) != 0 || arrow.is_null() {
-        return None;
-    }
-    let mut info: BITMAPINFO = std::mem::zeroed();
-    info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-    info.bmiHeader.biWidth = side;
-    info.bmiHeader.biHeight = -side;
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 32;
-    let dc = CreateCompatibleDC(std::ptr::null_mut());
-    let mut bits = std::ptr::null_mut();
-    let dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
-    let mut out = None;
-    if !dib.is_null() {
-        let old = SelectObject(dc, dib as _);
-        DrawIconEx(dc, 0, 0, arrow, side, side, 0, std::ptr::null_mut(), DI_NORMAL);
-        out = Some(std::slice::from_raw_parts(bits as *const u8, (side * side * 4) as usize).to_vec());
-        SelectObject(dc, old);
-        DeleteObject(dib as _);
-    }
-    DeleteDC(dc);
-    DestroyIcon(arrow);
-    out
-}
-
 /// Every item on the desktop by the name it shows, lower case, including Windows' own special items,
 /// so one with no file still opens and has its picture.
 pub unsafe fn desktop_items() -> std::collections::HashMap<String, PathBuf> {
@@ -238,13 +189,7 @@ pub unsafe fn sharp_icon(path: &Path, side: i32) -> isize {
         let mut raw = vec![0u8; (w * h * 4) as usize];
         let dc = CreateCompatibleDC(std::ptr::null_mut());
         if GetDIBits(dc, picture, 0, h as u32, raw.as_mut_ptr() as _, &mut info, DIB_RGB_COLORS) != 0 {
-            let mut pixels = square_pixels(&raw, w as usize, h as usize, side as usize);
-            let shortcut = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk") || e.eq_ignore_ascii_case("url"));
-            if shortcut {
-                if let Some(arrow) = arrow_pixels(side) {
-                    over_pixels(&mut pixels, &arrow);
-                }
-            }
+            let pixels = square_pixels(&raw, w as usize, h as usize, side as usize);
             info.bmiHeader.biWidth = side;
             info.bmiHeader.biHeight = -side;
             let mut bits = std::ptr::null_mut();
@@ -721,19 +666,6 @@ unsafe fn rename_box(path: &Path, at: POINT) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn an_arrow_sits_over_the_icon() {
-        let mut solid = [200, 100, 50, 255];
-        over_pixels(&mut solid, &[0, 0, 0, 0]); // nothing on top changes nothing
-        assert_eq!(solid, [200, 100, 50, 255]);
-        over_pixels(&mut solid, &[10, 20, 30, 255]); // solid on top replaces it
-        assert_eq!(solid, [10, 20, 30, 255]);
-        let mut clear = [0, 0, 0, 0];
-        over_pixels(&mut clear, &[50, 50, 50, 128]); // over nothing it keeps its own colour
-        assert_eq!(clear[3], 128);
-        assert_eq!(clear[0], 99);
-    }
 
     #[test]
     #[ignore] // needs a real desktop
