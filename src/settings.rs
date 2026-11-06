@@ -202,6 +202,7 @@ fn build_page(cfg: &Config, login: bool, dpi: f32, page: u8) -> Vec<Item> {
     b.choice("Labels on", "side", &["Left", "Right"], if cfg.right_side { "right" } else { "left" });
     b.choice_pairs("Icons", "icons", &[("Explorer", "explorer"), ("Rivulet", "own")], if cfg.own_icons { "own" } else { "explorer" });
     b.choice("Animation", "speed", &SPEEDS, &cfg.speed);
+    b.choice("Animation style", "entrance", &["Pour", "Unfold", "Curtain", "Pop", "Drift", "Trace"], &cfg.entrance);
     b.switch("New-file dots", cfg.dots, Action::Set("general", "dots", on_off(!cfg.dots)));
     b.switch("Click empty desktop to close", cfg.click_away, Action::Set("general", "click_away", on_off(!cfg.click_away)));
     b.switch("Double-click desktop hides labels", cfg.double_click_hide, Action::Set("general", "double_click_hide", on_off(!cfg.double_click_hide)));
@@ -610,6 +611,7 @@ mod tests {
                 match *key {
                     "theme" => assert_eq!(changed.theme, *value),
                     "speed" => assert_eq!(changed.speed, *value),
+                    "entrance" => assert_eq!(changed.entrance, *value),
                     "side" => assert_eq!(changed.right_side, value == "right"),
                     "dots" => assert_eq!(changed.dots, value == "on"),
                     "click_away" => assert_eq!(changed.click_away, value == "on"),

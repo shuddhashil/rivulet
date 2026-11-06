@@ -920,7 +920,7 @@ struct Sections {
     /// While a hover-opened section folds: its rail, label and full panel on screen, to see the mouse come back.
     fold_watch: Option<(RECT, RECT, RECT)>,
     /// The fold was cut short because the mouse came back; how far open it still was.
-    fold_back: Option<f32>,
+    fold_back: Option<Spring>,
     selected: Vec<PathBuf>,
     /// Where a Shift press measures from.
     anchor: i32,
@@ -1378,7 +1378,9 @@ impl Sections {
     }
 
     /// Run one open (forward) or close (backward) of a section.
-    unsafe fn flow(&mut self, plan: &Plan, at: usize, opening: bool, start: f32) {
+    /// Grow the panel out of its label, or fold it back. Width and height each ride a spring, so it
+    /// swells past full size and settles; `start` carries on a spring caught part-way through a fold.
+    unsafe fn flow(&mut self, plan: &Plan, at: usize, opening: bool, start: Option<Spring>) {
         let Some((full, across)) = plan.panel(at) else { return };
         // Rivulet draws its own icons as part of the panel, so Explorer's stay parked
         let icons = if plan.cfg.own_icons { vec![] } else { plan.groups[at].1.clone() };
@@ -1390,6 +1392,34 @@ impl Sections {
         let rows = (icons.len() as i32 + across - 1) / across;
         let (open_time, close_time) = speed_times(&plan.cfg.speed);
         let seconds = if opening { open_time } else { close_time };
+        let feel = spring_feel(&plan.cfg.speed).map(|(open, close)| if opening { open } else { close });
+        let target = if opening { 1.0 } else { 0.0 };
+        let mut sw = start.unwrap_or(Spring::new(1.0 - target, (1.0, 1.0)));
+        if let Some(f) = feel {
+            sw = Spring { pull: f.0, friction: f.1, ..sw }; // a caught fold turns round from the speed it had
+        }
+        // liquid styles: a softer height spring, so width and height settle out of step
+        let height_feel = if liquid { feel.map(softer) } else { feel }.unwrap_or((1.0, 1.0));
+        let mut sh = Spring { pull: height_feel.0, friction: height_feel.1, ..sw };
+        let mut last = Instant::now();
+        let mut gaps: Vec<f32> = vec![];
+        let what = if opening { "open" } else { "close" };
+        let floats = liquid && pretty::is_on();
+        // the animation style shapes both the opening and the closing
+        let style = if floats { layers::entrance_named(&plan.cfg.entrance) } else { layers::POUR };
+        // closing in a style runs on its own clock; Pour folds back on the spring as it always has
+        let styled_close = !opening && style != layers::POUR;
+        layers::set_leaving(styled_close);
+        if opening && style == layers::POP {
+            if let Some(f) = feel {
+                // a bubble: both sides together, well past full size and back
+                sw = Spring { pull: f.0 * 0.9, friction: 0.42, ..sw };
+                sh = sw;
+            }
+        }
+        // unfold opens one fold per row of files, the heading counting as one
+        let folds = ((full.h as f32 / (100.0 * m.dpi)).round() as u32).max(2);
+        layers::set_stage(1.0, 0.0, 0);
         let parked = (self.far(), plan.view_origin.1);
         let slide = (22.0 * m.dpi) as f32;
         // only the part of the icon list inside the panel needs repainting
@@ -1403,18 +1433,72 @@ impl Sections {
             self.park(&icons, parked); // leaving: icons go at once, and the panel folds up after them
         }
         let mut placed = vec![parked; icons.len()];
-        let began = Instant::now() - Duration::from_secs_f32(start * seconds);
+        let began = Instant::now() - Duration::from_secs_f32(start.map_or(0.0, |s| s.x.clamp(0.0, 1.0)) * seconds);
         loop {
             let t = if seconds > 0.0 { (began.elapsed().as_secs_f32() / seconds).min(1.0) } else { 1.0 };
-            let progress = if opening { t } else { 1.0 - t };
-            // the last frame lands exactly on full size, which is what tells Pretty mode it has stopped
-            let shape = if opening && t >= 1.0 { 1.0 } else if opening { spring(progress) } else { ease_out(progress) };
-            // liquid wobbles: height and width settle out of step
-            let (shape_w, shape_h) = if liquid && opening && t < 1.0 { jelly(progress) } else { (shape, shape) };
+            let raw = last.elapsed().as_secs_f32();
+            // a slow frame (or the set-up before the first) slows the motion rather than jumping it
+            let dt = raw.min(1.0 / 40.0);
+            last = Instant::now();
+            gaps.push(raw);
+            if feel.is_some() {
+                sw.step(target, dt);
+                sh.step(target, dt);
+            }
+            // the last frame lands exactly on the target, which is what tells Pretty mode it has stopped
+            let arrived = if opening && floats && seconds > 0.0 { (began.elapsed().as_secs_f32() / (seconds * FLOAT_LONGER)).min(1.0) } else { 1.0 };
+            let done = feel.is_none() || (sw.settled(target) && sh.settled(target) && (!opening || (t >= 1.0 && arrived >= 1.0)));
+            let gone = if styled_close && open_time > 0.0 { (began.elapsed().as_secs_f32() / (open_time * CLOSE_LONGER).max(CLOSE_LEAST)).min(1.0) } else { 1.0 };
+            let done = if styled_close { gone >= 1.0 } else { done };
+            if done {
+                (sw.x, sh.x) = (target, target);
+            }
+            // icons and fade follow the clock when opening; when closing they follow the fold itself
+            let progress = if opening { t } else if styled_close { 1.0 - gone } else { sw.x.clamp(0.0, 1.0) };
+            layers::set_reveal(if styled_close { 1.0 - gone } else { arrived });
+            // never folded smaller than the label it grows from
+            let (shape_w, shape_h) = (sw.x.max(0.0), sh.x.max(0.0));
             let w = mix(seed.w, full.w, shape_w);
             // the edge facing the rail stays put; the panel grows away from it
             let x = if right { full.x + full.w - w } else { full.x };
-            let r = Rect { x, y: mix(seed.y, full.y, shape_h), w, h: mix(seed.h, full.h, shape_h) };
+            let mut r = Rect { x, y: mix(seed.y, full.y, shape_h), w, h: mix(seed.h, full.h, shape_h) };
+            // how open the style shows it: rising while opening, falling while closing
+            let a = if styled_close { 1.0 - gone } else if done { 1.0 } else { arrived };
+            match style {
+                // full width at once, then the height opens fold by fold
+                layers::UNFOLD => r = Rect { h: mix(seed.h, full.h, layers::unfold_height(a, folds)), ..full },
+                // full size at once; the shader uncovers it
+                layers::CURTAIN => {
+                    r = full;
+                    layers::set_stage(1.0, layers::curtain_ring(a), layers::CURTAIN);
+                }
+                layers::TRACE => {
+                    r = full;
+                    layers::set_stage(1.0, layers::trace_stage(a), layers::TRACE);
+                }
+                // full size, fading in as it settles down from a little above
+                // settles down from above when opening; sinks and fades once the files have fallen away
+                layers::DRIFT => {
+                    let show = 1.0 - (1.0 - (a / 0.4).min(1.0)).powi(3);
+                    let drop = ((1.0 - show) * 14.0 * m.dpi) as i32;
+                    r = Rect { y: if opening { full.y - drop } else { full.y + drop }, ..full };
+                    layers::set_stage(show, 0.0, 0);
+                }
+                // closing: once the files have shrunk away the bubble swells a touch, then is drawn
+                // back into the label
+                layers::POP if !opening => {
+                    let k = ((gone - 0.45) / 0.55).clamp(0.0, 1.0);
+                    let shape = (1.0 - k * k * (2.7 * k - 1.7)).max(0.0);
+                    let w = mix(seed.w, full.w, shape);
+                    let x = if right { full.x + full.w - w } else { full.x };
+                    r = Rect { x, y: mix(seed.y, full.y, shape), w, h: mix(seed.h, full.h, shape) };
+                }
+                _ => {}
+            }
+            if done {
+                layers::set_stage(1.0, 0.0, 0);
+            }
+            neck_point(plan, r);
             self.draw_open(plan, at, r, ease_out((progress * 2.2).min(1.0)));
             if let (false, Some((rail, label, panel))) = (opening, self.fold_watch) {
                 let mut pt = POINT { x: 0, y: 0 };
@@ -1423,9 +1507,8 @@ impl Sections {
                     break; // on to another section: this one goes now, the next opens without waiting
                 }
                 if keeps_open(pt, rail, label, panel) {
-                    // back again: open from the size it has reached, on the opening curve
-                    let size = ease_out(progress);
-                    self.fold_back = Some((0..=100).map(|i| i as f32 / 100.0).find(|&t| spring(t) >= size).unwrap_or(1.0));
+                    // back again: the same spring turns round, keeping the speed it had
+                    self.fold_back = Some(sw);
                     break;
                 }
             }
@@ -1458,13 +1541,17 @@ impl Sections {
                     InvalidateRect(self.desk.lv, &dirty, 0);
                 }
             }
-            if t >= 1.0 {
+            if done {
+                frame_report(what, &gaps);
                 break;
             }
             if DwmFlush() != 0 {
                 std::thread::sleep(Duration::from_millis(8)); // no composition, so pace by hand
             }
         }
+        layers::set_leaving(false);
+        layers::set_stage(1.0, 0.0, 0);
+        layers::set_reveal(1.0);
     }
 
     unsafe fn park(&self, icons: &[usize], parked: (i32, i32)) {
@@ -1494,7 +1581,7 @@ impl Sections {
                 self.sync_settings(plan);
             }
             if animate {
-                self.flow(plan, at, false, 0.0);
+                self.flow(plan, at, false, None);
             } else {
                 self.park(&plan.groups[at].1, (self.far(), plan.view_origin.1));
             }
@@ -1595,7 +1682,7 @@ impl Sections {
                     None => {
                         self.show_rail(&plan);
                         self.sync_settings(&plan);
-                        self.flow(&plan, at, true, 0.0);
+                        self.flow(&plan, at, true, None);
                     }
                 }
             }
@@ -1611,21 +1698,46 @@ impl Sections {
         let (from_y, to_y) = (plan.pill_mid(from), plan.pill_mid(to));
         let (from_colour, to_colour) = (plan.colour(&plan.groups[from].0), plan.colour(&plan.groups[to].0));
         let liquid = matches!(plan.cfg.style.as_str(), "liquid" | "aurora" | "neon" | "clear");
+        // the move rides a spring a little firmer than opening, so it runs just past and settles back
         let seconds = speed_times(&plan.cfg.speed).0;
+        let feel = spring_feel(&plan.cfg.speed).map(|(open, _)| (open.0, (open.1 + 0.15).min(1.0)));
+        let mut glide_s = Spring::new(0.0, feel.unwrap_or((1.0, 1.0)));
+        // liquid arrives with a wobble, width and height settling out of step
+        let mut height_s = Spring::new(0.0, if liquid { feel.map(softer) } else { feel }.unwrap_or((1.0, 1.0)));
         // the new files show at once; the panel carries them to their place
         self.show_rail(plan);
         self.sync_settings(plan);
+        let mut last = Instant::now();
+        let mut gaps: Vec<f32> = vec![];
+        let what = "slide";
+        layers::set_stage(1.0, 0.0, 0);
+        let floats = liquid && pretty::is_on();
         let began = Instant::now();
         loop {
-            let t = if seconds > 0.0 { (began.elapsed().as_secs_f32() / seconds).min(1.0) } else { 1.0 };
-            let glide = t * t * (3.0 - 2.0 * t);
-            // liquid arrives with a wobble, width and height settling out of step
-            let (shape_w, shape_h) = if liquid && t < 1.0 { jelly(t) } else { (glide, glide) };
+            let raw = last.elapsed().as_secs_f32();
+            // a slow frame (or the set-up before the first) slows the motion rather than jumping it
+            let dt = raw.min(1.0 / 40.0);
+            last = Instant::now();
+            gaps.push(raw);
+            if feel.is_some() {
+                glide_s.step(1.0, dt);
+                height_s.step(1.0, dt);
+            }
+            let arrived = if floats && seconds > 0.0 { (began.elapsed().as_secs_f32() / (seconds * FLOAT_LONGER)).min(1.0) } else { 1.0 };
+            layers::set_reveal(arrived);
+            let done = feel.is_none() || (glide_s.settled(1.0) && height_s.settled(1.0) && arrived >= 1.0);
+            if done {
+                (glide_s.x, height_s.x) = (1.0, 1.0);
+            }
+            let glide = glide_s.x;
+            let (shape_w, shape_h) = (glide, height_s.x);
             let r = Rect { x: mix(old.x, new.x, glide), y: mix(old.y, new.y, glide), w: mix(old.w, new.w, shape_w), h: mix(old.h, new.h, shape_h) };
             let r = if plan.cfg.right_side { Rect { x: mix(old.x + old.w, new.x + new.w, glide) - r.w, ..r } } else { r };
-            layers::set_accent(blend(from_colour, to_colour, glide));
+            neck_point(plan, r);
+            layers::set_accent(blend(from_colour, to_colour, glide.clamp(0.0, 1.0)));
             self.draw_open_from(plan, mix(from_y, to_y, glide), r, 1.0);
-            if t >= 1.0 {
+            if done {
+                frame_report(what, &gaps);
                 break;
             }
             if DwmFlush() != 0 {
@@ -1667,7 +1779,7 @@ impl Sections {
             *OPENED_BY_HOVER.lock().unwrap() = Some(name);
             self.show_rail(&plan);
             self.sync_settings(&plan);
-            self.flow(&plan, at, true, start);
+            self.flow(&plan, at, true, Some(start));
         }
         let _ = std::fs::write(open_file(), self.open.as_deref().unwrap_or(""));
         self.settle()
@@ -1864,6 +1976,7 @@ impl Sections {
             paths.extend(self.selected.iter().filter(|p| **p != path).cloned());
             self.take_keys();
             shellmenu::show(paths);
+            self.back_to_hover(); // the mouse hook waits while the menu is up, so it folds only after
         }
     }
 
@@ -1940,7 +2053,10 @@ impl Sections {
                 let page = self.grid_rows().unwrap_or(1).max(1);
                 self.scroll_panel(if vk == VK_PRIOR { -page } else { page });
             }
-            VK_DELETE if !paths.is_empty() => shellmenu::verb(paths, "delete", shift),
+            VK_DELETE if !paths.is_empty() => {
+                shellmenu::verb(paths, "delete", shift);
+                self.back_to_hover();
+            }
             VK_F2 if paths.len() == 1 => {
                 let at = self.chosen().first().copied().unwrap_or(-1);
                 let spot = {
@@ -2421,6 +2537,12 @@ fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Com
 
 static DRAG_FROM_PANEL: AtomicBool = AtomicBool::new(false);
 static SETTINGS_OPEN: AtomicBool = AtomicBool::new(false);
+/// Files fly in over this many times the panel's opening time, so each flight can be followed.
+const FLOAT_LONGER: f32 = 2.5;
+/// A section closes in its style over this many times the opening time: quicker than it opened.
+const CLOSE_LONGER: f32 = 1.5;
+/// Never quicker than this, even at the fast speed, or the style cannot be seen leaving.
+const CLOSE_LEAST: f32 = 0.35;
 static CLICK_AWAY: AtomicBool = AtomicBool::new(true);
 static DOUBLE_CLICK_HIDES: AtomicBool = AtomicBool::new(true);
 static SWALLOW_RELEASE: AtomicBool = AtomicBool::new(false);
@@ -2956,6 +3078,28 @@ unsafe fn doctor() -> Result<(), String> {
 }
 
 /// A short record of starts and problems, with no file names in it, for bug reports.
+/// Where the neck joins a panel at `r`, in the panel's own pixels, for files to fly out of: the same
+/// height `draw_open_from` ends the neck at, just inside the edge that faces the rail.
+fn neck_point(plan: &Plan, r: Rect) {
+    let inset = (10.0 * plan.m.dpi) as i32;
+    let y = (r.h / 2).min((46.0 * plan.m.dpi) as i32);
+    layers::set_reveal_from(if plan.cfg.right_side { r.w - inset } else { inset }, y, r.w, r.h);
+    layers::set_entrance(layers::entrance_named(&plan.cfg.entrance));
+}
+
+/// One line per animation: frames, typical and worst gap between them, and how many were slow.
+fn frame_report(what: &str, gaps: &[f32]) {
+    if gaps.len() < 2 {
+        return;
+    }
+    let ms: Vec<f32> = gaps[1..].iter().map(|g| g * 1000.0).collect(); // the first gap is set-up
+    let mut sorted = ms.clone();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let slow = ms.iter().filter(|&&g| g > 20.0).count();
+    let all: Vec<String> = ms.iter().map(|g| format!("{g:.0}")).collect();
+    log(&format!("frames {what}: {} frames, set-up {:.0} ms, median {:.1} ms, worst {:.1} ms, slow {slow} [{}]", ms.len(), gaps[0] * 1000.0, sorted[sorted.len() / 2], sorted[sorted.len() - 1], all.join(" ")));
+}
+
 fn log(line: &str) {
     use std::io::Write;
     const KEEP: u64 = 64 * 1024;

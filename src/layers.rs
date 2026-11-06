@@ -76,6 +76,12 @@ pub trait Canvas {
     fn icon(&mut self, x: i32, y: i32, size: i32, icon: isize);
     /// A line round a rounded box.
     fn outline(&mut self, r: RECT, radius: i32, colour: u32, width: i32);
+    /// How visible what is drawn next is, 0 to 1; files flying in use it, everything else is 1.
+    fn set_fade(&mut self, _visible: f32) {}
+    /// An icon out of focus: `sharp` 1 is crisp, lower is softer, as a file flying in sharpens.
+    fn icon_soft(&mut self, x: i32, y: i32, size: i32, icon: isize, _wide: f32) {
+        self.icon(x, y, size, icon);
+    }
 }
 
 struct GdiCanvas {
@@ -467,15 +473,215 @@ pub fn paint_rail_on(c: &mut dyn Canvas, dpi: f32, base: u32) {
     }
 }
 
+/// How far the opening has come, 0 to 1 (as f32 bits); 1 when nothing moves.
+static REVEAL: AtomicU32 = AtomicU32::new(0x3F80_0000);
+
+pub fn set_reveal(at: f32) {
+    REVEAL.store(at.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+}
+
+/// Where the neck meets the panel, and the panel's size, in the panel's own pixels.
+static REVEAL_FROM: Mutex<(i32, i32, i32, i32)> = Mutex::new((0, 0, 1, 1));
+
+pub fn set_reveal_from(x: i32, y: i32, w: i32, h: i32) {
+    if let Ok(mut from) = REVEAL_FROM.lock() {
+        *from = (x, y, w.max(1), h.max(1));
+    }
+}
+
+/// The animation styles, each a whole way of opening: the panel's own motion and the files' together.
+pub const POUR: u32 = 0;
+pub const UNFOLD: u32 = 1;
+pub const CURTAIN: u32 = 2;
+pub const POP: u32 = 3;
+pub const DRIFT: u32 = 4;
+pub const TRACE: u32 = 5;
+static ENTRANCE: AtomicU32 = AtomicU32::new(POUR);
+
+pub fn set_entrance(kind: u32) {
+    ENTRANCE.store(kind, Ordering::Relaxed);
+}
+
+/// True while a section closes in its style: files leave by running their entrance backwards,
+/// except where leaving has its own way (Drift's leaves fall away downward).
+static LEAVING: AtomicBool = AtomicBool::new(false);
+
+pub fn set_leaving(on: bool) {
+    LEAVING.store(on, Ordering::Relaxed);
+}
+
+pub fn entrance() -> u32 {
+    ENTRANCE.load(Ordering::Relaxed)
+}
+
+pub fn entrance_named(name: &str) -> u32 {
+    match name {
+        "unfold" => UNFOLD,
+        "curtain" => CURTAIN,
+        "pop" => POP,
+        "drift" => DRIFT,
+        "trace" => TRACE,
+        _ => POUR,
+    }
+}
+
+/// What the glass shows of the panel while it opens: how visible it is, how far the style's own
+/// effect has come, and which effect (the shader's fade x, z and w). (1, 0, 0) is simply open.
+static STAGE: Mutex<[f32; 3]> = Mutex::new([1.0, 0.0, 0.0]);
+
+pub fn set_stage(show: f32, stage: f32, kind: u32) {
+    if let Ok(mut s) = STAGE.lock() {
+        *s = [show, stage, kind as f32];
+    }
+}
+
+pub fn stage() -> [f32; 3] {
+    STAGE.lock().map(|s| *s).unwrap_or([1.0, 0.0, 0.0])
+}
+
+fn smooth(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
+
+fn out_cubic(x: f32) -> f32 {
+    1.0 - (1.0 - x.clamp(0.0, 1.0)).powi(3)
+}
+
+/// Ends exactly at 1, running about 10% past on the way.
+fn back_out(x: f32) -> f32 {
+    let q = x.clamp(0.0, 1.0) - 1.0;
+    1.0 + 3.0 * q * q * q + 2.0 * q * q
+}
+
+/// Curtain: how far the circle opening from the neck has spread, as a share of the way to the
+/// panel's furthest corner (a little past 1, so the soft edge clears it).
+pub fn curtain_ring(at: f32) -> f32 {
+    out_cubic(at / 0.75) * 1.12
+}
+
+/// Trace: 0 to 1 while the outline draws itself round from the neck, then 1 to 2 while the inside fills.
+pub fn trace_stage(at: f32) -> f32 {
+    smooth(at / 0.45) + smooth((at - 0.45) / 0.2)
+}
+
+/// Unfold: how much of the panel's height is open, one fold of `folds` at a time.
+pub fn unfold_height(at: f32, folds: u32) -> f32 {
+    let n = folds.max(1) as f32;
+    let a = (at / 0.75).clamp(0.0, 1.0) * n;
+    let done = a.floor().min(n - 1.0);
+    ((done + back_out(a - done)) / n).min(1.0 + 0.04 / n)
+}
+
+fn centre(r: &RECT) -> (f32, f32) {
+    ((r.left + r.right) as f32 / 2.0, (r.top + r.bottom) as f32 / 2.0)
+}
+
+/// How far along its own entrance each item is, 0 to 1; everything but files is simply there.
+pub fn reveal_plan(items: &[Item]) -> Vec<f32> {
+    let at = f32::from_bits(REVEAL.load(Ordering::Relaxed));
+    if at >= 1.0 {
+        return vec![1.0; items.len()];
+    }
+    let (nx, ny, pw, ph) = REVEAL_FROM.lock().map(|f| (f.0 as f32, f.1 as f32, f.2 as f32, f.3 as f32)).unwrap_or((0.0, 0.0, 1.0, 1.0));
+    let shown = |i: &Item| matches!(i.look, Look::File(..)) && i.rect.right > i.rect.left;
+    let files: Vec<&Item> = items.iter().filter(|i| shown(i)).collect();
+    let count = files.len().max(2) as f32 - 1.0;
+    let from_neck = |c: (f32, f32)| ((c.0 - nx).powi(2) + (c.1 - ny).powi(2)).sqrt();
+    let furthest = files.iter().map(|i| from_neck(centre(&i.rect))).fold(1.0, f32::max);
+    // the middle of all the files, for Pop's centre-out pulse
+    let n = files.len().max(1) as f32;
+    let mx = files.iter().map(|i| centre(&i.rect).0).sum::<f32>() / n;
+    let my = files.iter().map(|i| centre(&i.rect).1).sum::<f32>() / n;
+    let from_mid = |c: (f32, f32)| ((c.0 - mx).powi(2) + (c.1 - my).powi(2)).sqrt();
+    let widest = files.iter().map(|i| from_mid(centre(&i.rect))).fold(1.0, f32::max);
+    let corner = [(0.0, 0.0), (pw, 0.0), (0.0, ph), (pw, ph)].iter().map(|&c| from_neck(c)).fold(1.0, f32::max);
+    let kind = entrance();
+    let mut rank = 0.0;
+    items
+        .iter()
+        .map(|i| {
+            if !matches!(i.look, Look::File(..)) {
+                return 1.0;
+            }
+            let c = centre(&i.rect);
+            let order = rank / count;
+            let shuffled = (rank * 0.618_034) % 1.0;
+            if shown(i) {
+                rank += 1.0;
+            }
+            let (delay, span) = match kind {
+                // the fold reaches the item's top at that share of the fold's time
+                UNFOLD => (0.75 * (i.rect.top as f32 / ph).clamp(0.0, 1.0), 0.25),
+                // each one shows as the spreading circle passes it
+                CURTAIN => return ((curtain_ring(at) - from_neck(c) / corner) / 0.18).clamp(0.0, 1.0),
+                POP => (0.4 * from_mid(c) / widest, 0.5),
+                // leaves fall in no particular order
+                DRIFT => (0.45 * shuffled, 0.55),
+                // they light up once the glass has filled
+                TRACE => (0.6 + 0.2 * order, 0.2),
+                _ => (0.35 * from_neck(c) / furthest, 0.5),
+            };
+            ((at - delay) / span).clamp(0.0, 1.0)
+        })
+        .collect()
+}
+
+/// One file part-way into place: its icon's centre and size, how much of its width shows (a hinge
+/// opening), and how visible the icon and the name are.
+#[derive(Debug, PartialEq)]
+pub struct Flight {
+    pub x: i32,
+    pub y: i32,
+    pub size: i32,
+    pub wide: f32,
+    pub icon: f32,
+    pub name: f32,
+}
+
+/// A file `own` of the way into `home`, its icon's resting centre, in the current style. Names never
+/// move or scale (their sharp text would shimmer); they fade in as the icon settles.
+pub fn flight(own: f32, home: (i32, i32), size: i32) -> Flight {
+    if own >= 1.0 {
+        return Flight { x: home.0, y: home.1, size, wide: 1.0, icon: 1.0, name: 1.0 };
+    }
+    let s = size as f32;
+    let at = |dx: f32, dy: f32| (home.0 + dx.round() as i32, home.1 + dy.round() as i32);
+    let (pos, scale, wide, icon, name) = match entrance() {
+        // a hinge at the icon's left edge swings open
+        UNFOLD => {
+            let wide = (82f32.to_radians() * (1.0 - smooth(own))).cos();
+            (home, 1.0, wide, smooth(own * 5.0), smooth((own - 0.7) / 0.3))
+        }
+        // simply uncovered by the spreading circle
+        CURTAIN => (home, 1.0, 1.0, smooth(own * 1.4), smooth((own - 0.3) / 0.7)),
+        // a pulse out from the middle: 55% up past full and back
+        POP => (home, 0.55 + 0.45 * back_out(own), 1.0, smooth(own * 4.0), smooth((own - 0.45) / 0.35)),
+        // falls from above, swaying side to side like a leaf, slowing as it lands
+        DRIFT => {
+            let left = 1.0 - out_cubic(own);
+            let fall = if LEAVING.load(Ordering::Relaxed) { 1.4 } else { -1.4 }; // in from above, away below
+            (at((own * std::f32::consts::PI * 2.5).sin() * s * 0.35 * left, s * fall * left), 1.0, 1.0, smooth(own * 2.5), smooth((own - 0.6) / 0.4))
+        }
+        // lights up where it is
+        TRACE => (home, 0.9 + 0.1 * out_cubic(own), 1.0, smooth(own * 1.5), smooth((own - 0.4) / 0.6)),
+        // pour: the panel carries the motion from the neck; each file lifts into its slot
+        _ => (at(0.0, 24f32.min(0.45 * s) * (1.0 - out_cubic(own))), 1.0, 1.0, smooth(own * 3.0), smooth((own - 0.35) / 0.4)),
+    };
+    Flight { x: pos.0, y: pos.1, size: ((s * scale).round() as i32).max(2), wide, icon, name }
+}
+
 pub fn paint_settings_on(c: &mut dyn Canvas, dpi: f32, base: u32, accent: u32) {
     let radius = (10.0 * dpi) as i32;
     let idle = blend(base, WHITE, 0.10);
     let chosen = SELECTED_ITEMS.lock().map(|s| s.clone()).unwrap_or_default();
     if let Ok(items) = SETTINGS_ITEMS.lock() {
+        let reveal = reveal_plan(&items);
         for (index, item) in items.iter().enumerate() {
             let r = item.rect;
-            if r.right <= r.left {
-                continue; // scrolled out of view
+            let own = reveal[index];
+            if r.right <= r.left || own <= 0.0 {
+                continue; // scrolled out of view, or not yet out of the neck
             }
             match &item.look {
                 Look::Thumb => c.wash(r, r.right - r.left, WHITE, 110),
@@ -490,16 +696,22 @@ pub fn paint_settings_on(c: &mut dyn Canvas, dpi: f32, base: u32, accent: u32) {
                 Look::File(name, icon) if item.row => {
                     let inset = (2.0 * dpi) as i32;
                     let selected = chosen.contains(&(index as i32));
-                    if selected || HOVER_ITEM.load(Ordering::Relaxed) == index as i32 {
+                    if own >= 1.0 && (selected || HOVER_ITEM.load(Ordering::Relaxed) == index as i32) {
                         c.wash(RECT { left: r.left + inset, top: r.top + inset / 2, right: r.right - inset, bottom: r.bottom - inset / 2 }, (6.0 * dpi) as i32, accent, if selected { 140 } else { 90 });
                     }
                     let size = crate::settings::list_icon_pixels(dpi);
                     let side = (8.0 * dpi) as i32;
-                    c.icon(r.left + side, r.top + (r.bottom - r.top - size) / 2, size, *icon);
-                    let name_left = r.left + side * 2 + size;
-                    let detail_w = (170.0 * dpi) as i32;
-                    c.text(RECT { left: name_left, top: r.top, right: r.right - detail_w - side, bottom: r.bottom }, name, text_colour(), Style::Name, DT_LEFT | DT_END_ELLIPSIS);
-                    c.text(RECT { left: r.right - detail_w, top: r.top, right: r.right - side, bottom: r.bottom }, &item.detail, SOFT, Style::Small, DT_RIGHT);
+                    let f = flight(own, (r.left + side + size / 2, r.top + (r.bottom - r.top) / 2), size);
+                    c.set_fade(f.icon);
+                    c.icon_soft(f.x - f.size / 2, f.y - f.size / 2, f.size, *icon, f.wide);
+                    if f.name > 0.0 {
+                        c.set_fade(f.name);
+                        let name_left = r.left + side * 2 + size;
+                        let detail_w = (170.0 * dpi) as i32;
+                        c.text(RECT { left: name_left, top: r.top, right: r.right - detail_w - side, bottom: r.bottom }, name, text_colour(), Style::Name, DT_LEFT | DT_END_ELLIPSIS);
+                        c.text(RECT { left: r.right - detail_w, top: r.top, right: r.right - side, bottom: r.bottom }, &item.detail, SOFT, Style::Small, DT_RIGHT);
+                    }
+                    c.set_fade(1.0);
                 }
                 Look::Heading(t) => c.text(r, t, text_colour(), Style::Heading, DT_LEFT | DT_END_ELLIPSIS),
                 Look::Text(t) => c.text(RECT { right: r.right + (200.0 * dpi) as i32, ..r }, t, text_colour(), Style::Label, DT_LEFT),
@@ -508,17 +720,23 @@ pub fn paint_settings_on(c: &mut dyn Canvas, dpi: f32, base: u32, accent: u32) {
                 Look::File(name, icon) => {
                     let selected = chosen.contains(&(index as i32));
                     let hovered = HOVER_ITEM.load(Ordering::Relaxed) == index as i32;
-                    if selected || hovered {
+                    if own >= 1.0 && (selected || hovered) {
                         let inset = (3.0 * dpi) as i32;
                         let wash = RECT { left: r.left + inset, top: r.top + inset, right: r.right - inset, bottom: r.bottom - inset };
                         c.wash(wash, (10.0 * dpi) as i32, accent, if selected { 140 } else { 90 });
                     }
                     let size = crate::settings::icon_pixels(dpi);
                     let top = r.top + (6.0 * dpi) as i32;
-                    c.icon((r.left + r.right - size) / 2, top, size, *icon);
-                    let inset = (5.0 * dpi) as i32;
-                    let words = RECT { left: r.left + inset, top: top + size + inset / 2, right: r.right - inset, bottom: top + size + inset / 2 + 2 * name_line(dpi) + 2 };
-                    c.text(words, name, text_colour(), Style::Name, DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
+                    let f = flight(own, ((r.left + r.right) / 2, top + size / 2), size);
+                    c.set_fade(f.icon);
+                    c.icon_soft(f.x - f.size / 2, f.y - f.size / 2, f.size, *icon, f.wide);
+                    if f.name > 0.0 {
+                        c.set_fade(f.name);
+                        let inset = (5.0 * dpi) as i32;
+                        let words = RECT { left: r.left + inset, top: top + size + inset / 2, right: r.right - inset, bottom: top + size + inset / 2 + 2 * name_line(dpi) + 2 };
+                        c.text(words, name, text_colour(), Style::Name, DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
+                    }
+                    c.set_fade(1.0);
                 }
                 Look::Button(t) => {
                     c.fill(r, radius, idle);
@@ -742,4 +960,61 @@ pub unsafe fn set_neck(from: (i32, i32), to: (i32, i32), reach: f32, end_width: 
     SetWindowRgn(neck(), CreatePolygonRgn(points.as_ptr(), points.len() as i32, WINDING), 1);
     InvalidateRect(neck(), null(), 0);
     UpdateWindow(neck());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_animation_style_brings_files_in_its_own_way_and_lands_home() {
+        let file = |x: i32, y: i32| Item { rect: RECT { left: x, top: y, right: x + 80, bottom: y + 90 }, look: Look::File("f".into(), 0), action: None, row: false, detail: String::new() };
+        let items = vec![file(0, 0), file(400, 0), file(0, 300), file(400, 300), file(200, 150), Item { look: Look::Heading("h".into()), ..file(0, 0) }];
+        set_reveal_from(0, 40, 480, 390);
+        let home = (300, 200);
+        for kind in [POUR, UNFOLD, CURTAIN, POP, DRIFT, TRACE] {
+            set_entrance(kind);
+            set_reveal(0.0);
+            assert!(reveal_plan(&items)[..5].iter().all(|&k| k == 0.0), "{kind}: nothing yet");
+            set_reveal(0.5);
+            assert_eq!(reveal_plan(&items)[5], 1.0); // only files move
+            set_reveal(1.0);
+            assert!(reveal_plan(&items).iter().all(|&k| k == 1.0));
+            let start = flight(0.0, home, 48);
+            assert!(start.icon == 0.0 && start.name == 0.0, "{kind}: hidden at first");
+            assert_eq!(flight(1.0, home, 48), Flight { x: 300, y: 200, size: 48, wide: 1.0, icon: 1.0, name: 1.0 });
+        }
+        // pour lifts each file up from below its slot
+        set_entrance(POUR);
+        assert!(flight(0.2, home, 48).y > home.1 && flight(0.2, home, 48).x == home.0);
+        // unfold swings each icon open from a sliver
+        set_entrance(UNFOLD);
+        assert!(flight(0.05, home, 48).wide < 0.3 && flight(0.6, home, 48).wide > 0.5);
+        // pop: the middle first, and it grows past full size before settling
+        set_entrance(POP);
+        set_reveal(0.2);
+        let k = reveal_plan(&items);
+        assert!(k[4] > k[0] && k[4] > k[3], "{k:?}");
+        assert!((1..100).any(|i| flight(i as f32 / 100.0, home, 48).size > 48));
+        // drift falls from above, and when leaving falls away below
+        set_entrance(DRIFT);
+        assert!(flight(0.2, home, 48).y < home.1);
+        set_leaving(true);
+        assert!(flight(0.2, home, 48).y > home.1);
+        set_leaving(false);
+        // curtain uncovers the nearest the neck first
+        set_entrance(CURTAIN);
+        set_reveal(0.3);
+        let k = reveal_plan(&items);
+        assert!(k[0] > k[3], "{k:?}");
+        // trace: files wait for the outline and the fill
+        set_entrance(TRACE);
+        set_reveal(0.55);
+        assert!(reveal_plan(&items)[..5].iter().all(|&k| k == 0.0));
+        assert!(trace_stage(0.3) < 1.0 && trace_stage(0.5) > 1.0 && (trace_stage(1.0) - 2.0).abs() < 1e-5);
+        assert!(curtain_ring(1.0) > 1.0 && curtain_ring(0.0) == 0.0);
+        assert!((unfold_height(1.0, 3) - 1.0).abs() < 1e-5 && unfold_height(0.1, 3) < 0.5);
+        set_entrance(POUR);
+        set_reveal(1.0);
+    }
 }

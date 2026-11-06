@@ -10,7 +10,7 @@ use std::ffi::c_void;
 use std::result::Result::Ok; // GdiPlus also defines a constant called Ok
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use windows::core::{Interface, GUID, HRESULT};
 use windows::Win32::Foundation::{FreeLibrary, HWND as ComHwnd, RECT as ComRect};
 use windows::Win32::Graphics::Direct3D::*;
@@ -556,6 +556,10 @@ unsafe fn draw_text(t: &TextTarget, r: RECT, text: &str, colour: u32, style: Sty
     if w <= 0 || h <= 0 {
         return;
     }
+    let fade = draw_fade();
+    if fade == 0 {
+        return;
+    }
     let tile = text_tile(text, w, h, style, flags, dpi);
     let at = |x: i32, y: i32| -> Option<usize> {
         let (l, top, right, bottom) = t.clip;
@@ -575,7 +579,7 @@ unsafe fn draw_text(t: &TextTarget, r: RECT, text: &str, colour: u32, style: Sty
                     let most = (c & 255).max((c >> 8) & 255).max((c >> 16) & 255);
                     if most > 0 {
                         if let Some(i) = at(left + x + dx * drop, top + y + dy * drop) {
-                            *t.page.add(i) = shade(*t.page.add(i), most * 88 / 255);
+                            *t.page.add(i) = shade(*t.page.add(i), most * 88 / 255 * fade / 256);
                         }
                     }
                 }
@@ -584,7 +588,7 @@ unsafe fn draw_text(t: &TextTarget, r: RECT, text: &str, colour: u32, style: Sty
     }
     for y in 0..h {
         for x in 0..w {
-            let cover = tile[(y * w + x) as usize] & 0x00FF_FFFF;
+            let cover = faded(tile[(y * w + x) as usize] & 0x00FF_FFFF, fade);
             if cover == 0 {
                 continue;
             }
@@ -599,6 +603,22 @@ unsafe fn draw_text(t: &TextTarget, r: RECT, text: &str, colour: u32, style: Sty
             }
         }
     }
+}
+
+/// How visible what is drawn next is, 0 to 256: files flying in fade their icon and name with it.
+static DRAW_FADE: AtomicU32 = AtomicU32::new(256);
+
+fn draw_fade() -> u32 {
+    DRAW_FADE.load(Ordering::Relaxed)
+}
+
+/// Every channel of a pixel scaled by a fade of 0 to 256.
+fn faded(px: u32, fade: u32) -> u32 {
+    if fade >= 256 {
+        return px;
+    }
+    let ch = |shift: u32| ((((px >> shift) & 0xFF) * fade) >> 8) << shift;
+    ch(0) | ch(8) | ch(16) | ch(24)
 }
 
 /// The text of one piece of glass, for the card to blend over it, the size of that piece's page.
@@ -719,6 +739,22 @@ impl Canvas for PlusCanvas {
     }
 
     fn icon(&mut self, x: i32, y: i32, size: i32, icon: isize) {
+        self.icon_soft(x, y, size, icon, 1.0);
+    }
+
+    fn set_fade(&mut self, visible: f32) {
+        DRAW_FADE.store((visible.clamp(0.0, 1.0) * 256.0) as u32, Ordering::Relaxed);
+    }
+
+    /// Out of focus is drawn small and smoothed up to size, which blurs it for next to nothing.
+    /// The icon at `shown` size, only `wide` of its width showing, as a hinge opening shows it.
+    fn icon_soft(&mut self, x: i32, y: i32, shown: i32, icon: isize, wide: f32) {
+        let fade = draw_fade();
+        let across = ((shown as f32 * wide).round() as i32).clamp(1, shown);
+        if fade == 0 || shown <= 0 {
+            return;
+        }
+        let size = shown;
         unsafe {
             // GDI+ loses an icon's transparency when given it directly, so draw it into memory first
             use windows_sys::Win32::Graphics::Gdi::*;
@@ -735,18 +771,22 @@ impl Canvas for PlusCanvas {
                 let old = SelectObject(dc, dib as _);
                 windows_sys::Win32::UI::WindowsAndMessaging::DrawIconEx(dc, 0, 0, icon as _, size, size, 0, std::ptr::null_mut(), windows_sys::Win32::UI::WindowsAndMessaging::DI_NORMAL);
                 let mode = layers::ICON_TINT.load(Ordering::Relaxed);
-                if mode != 0 {
+                if mode != 0 || fade < 256 {
                     let colour = layers::tint_colour();
                     for pixel in std::slice::from_raw_parts_mut(bits as *mut u32, (size * size) as usize) {
-                        *pixel = layers::tint_pixel(*pixel, mode, colour);
+                        if mode != 0 {
+                            *pixel = layers::tint_pixel(*pixel, mode, colour);
+                        }
+                        *pixel = faded(*pixel, fade); // icons are premultiplied, so every channel fades
                     }
                 }
                 let mut picture = std::ptr::null_mut();
                 if GdipCreateBitmapFromScan0(size, size, size * 4, PARGB, bits as *mut u8, &mut picture) == 0 {
-                    // pixel for pixel: the usual smoothing would soften an icon already the right size
-                    GdipSetInterpolationMode(self.g, InterpolationModeNearestNeighbor);
+                    // pixel for pixel when whole: the usual smoothing would soften an icon already the
+                    // right size; squeezed by a hinge, smoothing keeps it clean
+                    GdipSetInterpolationMode(self.g, if across == shown { InterpolationModeNearestNeighbor } else { InterpolationModeHighQualityBilinear });
                     GdipSetPixelOffsetMode(self.g, PixelOffsetModeHalf);
-                    GdipDrawImageRectI(self.g, picture as _, x, y, size, size);
+                    GdipDrawImageRectI(self.g, picture as _, x, y, across, shown);
                     GdipSetPixelOffsetMode(self.g, PixelOffsetModeDefault);
                     GdipSetInterpolationMode(self.g, InterpolationModeDefault);
                     GdipDisposeImage(picture as _);
@@ -1345,7 +1385,7 @@ impl Engine {
     unsafe fn glass_panel(&mut self, repaint: bool) {
         let Some((p, n)) = self.open_panel else { return };
         let dpi = self.dpi;
-        let margin = (26.0 * dpi) as i32;
+        let margin = (52.0 * dpi) as i32; // room for the soft shadow, which reaches 50 below
         let rail = self.rail_rect;
         let (mut left, mut top, mut right, mut bottom) = (p.x, p.y, p.x + p.w, p.y + p.h);
         for (cx, cy) in [n.from, n.to] {
@@ -1406,7 +1446,9 @@ impl Engine {
                 neck2: [if pill.is_some() { 1.0 } else { 0.0 }, n.reach.clamp(0.02, 1.0), n.end_width / 2.0, n.mid_width / 2.0],
                 pill: pill.unwrap_or([0.0; 4]),
                 glow: vivid(layers::accent()),
-                fade: [1.0, 0.0, 0.0, 0.0],
+                // y: the open panel floats, so it casts the wide soft shadow; x, z and w: how the
+                // animation style is showing it while it opens
+                fade: { let [show, stage, kind] = layers::stage(); [show, 1.0, stage, kind] },
                 ..base
             };
             let names = if settings { self.panel_text.views() } else { None };
@@ -1478,6 +1520,15 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_glass_shader_compiles() {
+        // a shader that fails to compile silently drops every liquid style back to plain Glass
+        let source = include_str!("liquid.hlsl");
+        for (entry, target) in [(&b"cover_screen\0"[..], &b"vs_5_0\0"[..]), (b"glass\0", b"ps_5_0\0"), (b"words\0", b"ps_5_0\0"), (b"names\0", b"ps_5_0\0")] {
+            unsafe { compile(source, entry, target) }.unwrap_or_else(|e| panic!("{e}"));
+        }
+    }
 
     #[test]
     fn cleartype_blends_each_colour_by_its_own_amount() {

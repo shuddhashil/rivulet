@@ -14,7 +14,7 @@ cbuffer Glass : register(b0) {
     float4 pill;   // the label the neck comes out of
     float4 look;   // 0 liquid, 1 aurora, 2 neon, 3 clear; seconds; how strongly this piece glows
     float4 glow;   // this section's colour
-    float4 fade;   // x: how visible this piece is, 0 to 1
+    float4 fade;   // x: how visible this piece is, 0 to 1; y: casts the wide shadow; z, w: opening effect
 };
 
 Texture2D picture : register(t0);
@@ -88,6 +88,14 @@ float4 glass_core(float4 position : SV_Position) : SV_Target {
             // neon: light spilling out of the tube instead of a shadow
             float a = exp(-d / (5 * scale)) * saturate(1 - d / (14 * scale)) * (0.40 + 0.35 * mouse.z) * look.z;
             return float4(glow.rgb * a, a * 0.55);
+        }
+        if (fade.y > 0.5) {
+            // the open panel floats: a faint line hugging its edge, under a wide soft haze dropped
+            // below it, as Windows' own flyouts have. It fades to nothing before the picture's edge.
+            float edge = max(glass_distance(p - float2(0, 1.5 * scale)), 0);
+            float drop = max(glass_distance(p - float2(0, 14 * scale)), 0);
+            float reach = saturate(1 - drop / (36 * scale));
+            return float4(0, 0, 0, 0.16 * exp(-edge / (2.5 * scale)) + 0.24 * exp(-drop / (13 * scale)) * reach * reach);
         }
         float gap = max(glass_distance(p - float2(0, 5 * scale)), 0);
         return float4(0, 0, 0, 0.30 * exp(-gap / (6 * scale)) * saturate(1 - gap / (13 * scale)));
@@ -195,12 +203,59 @@ float4 glass_core(float4 position : SV_Position) : SV_Target {
     return float4(colour * cover, cover) + float4(0, 0, 0, 0.30 * (1 - cover));
 }
 
+// Opening effects (fade.w): 2 curtain, a circle spreading from where the neck meets the panel with
+// a lit edge; 5 trace, a lit line drawing the outline round from the neck before the glass fills.
+float2 stage_origin() {
+    return neck2.x > 0.5 ? neck1.zw : box.xy;
+}
+
+float curtain_radius() {
+    float2 o = stage_origin();
+    float far = max(max(length(box.xy - o), length(box.xy + float2(box.z, 0) - o)),
+                    max(length(box.xy + float2(0, box.w) - o), length(box.xy + box.zw - o)));
+    return fade.z * far;
+}
+
+float stage_mask(float2 p) {
+    if (abs(fade.w - 2) < 0.5) {
+        return saturate((curtain_radius() - length(p - stage_origin())) / (26 * shape.w));
+    }
+    if (abs(fade.w - 5) < 0.5) {
+        return saturate(fade.z - 1);
+    }
+    return 1;
+}
+
+float4 stage_light(float2 p) {
+    float scale = shape.w;
+    if (abs(fade.w - 2) < 0.5) {
+        float cover = saturate(0.5 - glass_distance(p));
+        float off = abs(length(p - stage_origin()) - curtain_radius() + 10 * scale);
+        float a = exp(-off / (7 * scale)) * cover * 0.55 * saturate(1.1 - fade.z) * 4;
+        return float4(saturate(glow.rgb * 0.8 + 0.35) * a, a * 0.8);
+    }
+    if (abs(fade.w - 5) < 0.5) {
+        float d = glass_distance(p);
+        float2 c = box.xy + box.zw / 2;
+        float2 q = (p - c) / max(box.zw / 2, 1);
+        float2 o = (stage_origin() - c) / max(box.zw / 2, 1);
+        float round_from_neck = acos(clamp(dot(normalize(q + 0.0001), normalize(o + 0.0001)), -1, 1)) / 3.14159;
+        float drawn = saturate((saturate(fade.z) * 1.03 - round_from_neck) / 0.025);
+        float lit = exp(-abs(d) / (1.6 * scale)) * drawn * (1 - 0.7 * saturate(fade.z - 1));
+        float core = exp(-abs(d) / (0.6 * scale)) * drawn;
+        float3 colour = saturate(glow.rgb * 1.3 + 0.15) * lit + core * 0.5;
+        return float4(colour, saturate(lit * 0.9 + core * 0.4));
+    }
+    return 0;
+}
+
 float4 glass(float4 position : SV_Position) : SV_Target {
-    return glass_core(position) * fade.x;
+    float4 c = glass_core(position) * stage_mask(position.xy) + stage_light(position.xy);
+    return saturate(c) * fade.x;
 }
 
 float4 words(float4 position : SV_Position) : SV_Target {
-    return picture.Load(int3(position.xy, 0)) * fade.x;
+    return picture.Load(int3(position.xy, 0)) * fade.x * stage_mask(position.xy);
 }
 
 // Text with each of red, green and blue covered by its own amount, as ClearType asks: t0 holds the
@@ -214,10 +269,10 @@ struct NamesOut {
 };
 
 NamesOut names(float4 position : SV_Position) {
-    float3 cover = text_cover.Load(int3(position.xy, 0)).rgb * fade.x;
+    float3 cover = text_cover.Load(int3(position.xy, 0)).rgb * fade.x * stage_mask(position.xy);
     float most = max(cover.r, max(cover.g, cover.b));
     NamesOut out_;
-    out_.colour = float4(picture.Load(int3(position.xy, 0)).rgb * fade.x, most);
+    out_.colour = float4(picture.Load(int3(position.xy, 0)).rgb * fade.x * stage_mask(position.xy), most);
     out_.keep = float4(cover, most);
     return out_;
 }

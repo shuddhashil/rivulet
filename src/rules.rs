@@ -35,6 +35,8 @@ pub struct Config {
     pub icon_tint: String,
     pub corners: String,
     pub panel: String,
+    /// How a section opens, the panel and its files together: pour, unfold, curtain, pop, drift or trace.
+    pub entrance: String,
     /// Open a section when the mouse rests on its label.
     pub hover_open: bool,
     /// A section's own symbol, in place of the usual one.
@@ -138,6 +140,7 @@ pub fn set_setting(text: &str, part: &str, key: &str, value: &str) -> String {
     lines.join("\n") + "\n"
 }
 
+pub const ANIMATIONS: [&str; 6] = ["pour", "unfold", "curtain", "pop", "drift", "trace"];
 pub const SORTS: [&str; 5] = ["newest", "oldest", "name", "name_desc", "type"];
 pub const FONTS: [&str; 5] = ["segoe ui", "calibri", "arial", "verdana", "tahoma"];
 
@@ -166,6 +169,7 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
         icon_tint: "off".to_string(),
         corners: "soft".to_string(),
         panel: "normal".to_string(),
+        entrance: "pour".to_string(),
         hover_open: false,
         symbols: vec![],
         sort: vec![],
@@ -284,13 +288,14 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
                         _ => cfg.panel_colour = colour,
                     }
                 }
-                "font" | "text_size" | "icon_size" | "icon_tint" | "corners" | "panel" => {
+                "font" | "text_size" | "icon_size" | "icon_tint" | "corners" | "panel" | "entrance" => {
                     let (allowed, slot): (&[&str], &mut String) = match key.as_str() {
                         "font" => (&FONTS, &mut cfg.font),
                         "text_size" => (&["small", "normal", "large"], &mut cfg.text_size),
                         "icon_size" => (&["small", "medium", "large"], &mut cfg.icon_size),
                         "icon_tint" => (&["off", "section", "mono"], &mut cfg.icon_tint),
                         "corners" => (&["square", "soft", "round"], &mut cfg.corners),
+                        "entrance" => (&ANIMATIONS, &mut cfg.entrance),
                         _ => (&["clear", "normal", "solid"], &mut cfg.panel),
                     };
                     if !allowed.contains(&value) {
@@ -723,20 +728,61 @@ pub fn neck_outline(from: (f32, f32), to: (f32, f32), reach: f32, end_width: f32
 }
 
 /// A damped spring: rushes out, swells a little past the end, settles back.
-pub fn spring(t: f32) -> f32 {
-    1.0 - (-7.0 * t).exp() * (9.0 * t).cos()
+/// A real spring: a position and a speed, pulled toward a target and slowed by friction. Unlike a
+/// curve on a fixed clock it keeps its speed when caught mid-way, and stops when it has settled.
+#[derive(Clone, Copy, Debug)]
+pub struct Spring {
+    pub x: f32,
+    pub v: f32,
+    pub pull: f32,     // natural frequency, radians a second: higher is snappier
+    pub friction: f32, // damping ratio: below 1 overshoots and wobbles, 1 just arrives
 }
-/// Liquid wobble: width and height settle out of step, so the panel squashes and stretches.
-pub fn jelly(t: f32) -> (f32, f32) {
-    let wobble = |t: f32, speed: f32| 1.0 - (-6.0 * t).exp() * (speed * t).cos();
-    (wobble(t, 11.0), wobble((t - 0.07).max(0.0), 13.0))
+
+impl Spring {
+    pub fn new(x: f32, (pull, friction): (f32, f32)) -> Self {
+        Spring { x, v: 0.0, pull, friction }
+    }
+
+    /// Move on by `dt` seconds, in small steps so a slow frame cannot make it fly apart.
+    pub fn step(&mut self, target: f32, dt: f32) {
+        let dt = dt.min(0.2);
+        let n = (dt / 0.002).ceil().max(1.0) as i32;
+        let h = dt / n as f32;
+        for _ in 0..n {
+            let a = -self.pull * self.pull * (self.x - target) - 2.0 * self.friction * self.pull * self.v;
+            self.v += a * h;
+            self.x += self.v * h;
+        }
+    }
+
+    pub fn settled(&self, target: f32) -> bool {
+        (self.x - target).abs() < 0.002 && self.v.abs() < 0.02
+    }
+}
+
+/// (pull, friction) for opening and for closing at each speed; None when motion is off.
+/// Opening overshoots and settles; closing is critically damped, so it never bounces back out.
+pub fn spring_feel(speed: &str) -> Option<((f32, f32), (f32, f32))> {
+    match speed {
+        "off" => None,
+        // one clear swell, then a quick settle: a lighter damping rings in pixel-sized hops that shiver
+        "fast" => Some(((40.0, 0.72), (55.0, 1.0))),
+        "relaxed" => Some(((20.0, 0.68), (26.0, 1.0))),
+        _ => Some(((28.0, 0.7), (36.0, 1.0))),
+    }
+}
+
+/// Liquid styles: the height spring is a touch softer, so width and height settle out of step
+/// and the panel squashes and stretches.
+pub fn softer((pull, friction): (f32, f32)) -> (f32, f32) {
+    (pull * 0.85, friction * 0.92)
 }
 
 pub fn ease_out(t: f32) -> f32 {
     1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t)
 }
 pub fn mix(a: i32, b: i32, t: f32) -> i32 {
-    a + ((b - a) as f32 * t) as i32
+    a + ((b - a) as f32 * t).round() as i32
 }
 
 /// Colours are blue, green, red; `t` runs from all of a to all of b.
@@ -1059,21 +1105,60 @@ mod tests {
         assert!(half.iter().all(|(x, _)| *x < 60.0)); // a partial neck stops short
     }
 
-    #[test]
-    fn jelly_starts_small_wobbles_and_ends_near_full_size() {
-        assert!(jelly(0.0).0.abs() < 0.001);
-        let (w, h) = jelly(1.0);
-        assert!((w - 1.0).abs() < 0.02 && (h - 1.0).abs() < 0.03, "{w} {h}");
-        let peak = (0..=100).map(|i| jelly(i as f32 / 100.0).0).fold(0.0, f32::max);
-        assert!(peak > 1.02 && peak < 1.3, "{peak}");
-        assert!((1..30).any(|i| { let (a, b) = jelly(i as f32 / 100.0); (a - b).abs() > 0.05 })); // out of step
+    /// Runs a spring at 60 frames a second; returns its peak, its lowest point and seconds to settle.
+    fn run(mut s: Spring, target: f32) -> (f32, f32, f32) {
+        let (mut hi, mut lo, mut t) = (s.x, s.x, 0.0);
+        while !s.settled(target) && t < 5.0 {
+            s.step(target, 1.0 / 60.0);
+            hi = hi.max(s.x);
+            lo = lo.min(s.x);
+            t += 1.0 / 60.0;
+        }
+        (hi, lo, t)
     }
 
     #[test]
-    fn motion_ends_where_it_should() {
-        assert!(spring(0.0).abs() < 0.001 && (spring(1.0) - 1.0).abs() < 0.01);
-        let peak = (0..=100).map(|i| spring(i as f32 / 100.0)).fold(0.0, f32::max);
-        assert!(peak > 1.0 && peak < 1.2, "{peak}"); // swells, but not wildly
+    fn springs_open_with_a_swell_and_close_without_bouncing() {
+        for speed in ["fast", "normal", "relaxed"] {
+            let (open, close) = spring_feel(speed).unwrap();
+            let (peak, _, secs) = run(Spring::new(0.0, open), 1.0);
+            assert!(peak > 1.03 && peak < 1.1, "{speed} {peak}"); // swells, but not wildly
+            assert!(secs > 0.1 && secs < 0.6, "{speed} {secs}");
+            // the swell is the only bounce: no second dip below full size worth a pixel on a big panel
+            let mut s = Spring::new(0.0, open);
+            let mut over = false;
+            let mut dip: f32 = 1.0;
+            for _ in 0..120 {
+                s.step(1.0, 1.0 / 60.0);
+                over |= s.x > 1.0;
+                if over { dip = dip.min(s.x); }
+            }
+            assert!(dip > 0.997, "{speed} dip {dip}");
+            let (peak, low, secs) = run(Spring::new(0.0, softer(open)), 1.0);
+            assert!(peak < 1.35 && low > -0.01 && secs < 1.2, "{speed} soft {peak} {secs}");
+            let (_, low, secs) = run(Spring::new(1.0, close), 0.0);
+            assert!(low > -0.002 && secs < 0.5, "{speed} close {low} {secs}"); // never past shut
+        }
+        assert!(spring_feel("off").is_none());
+    }
+
+    #[test]
+    fn a_caught_spring_keeps_its_speed_and_a_slow_frame_stays_calm() {
+        let (open, close) = spring_feel("normal").unwrap();
+        let mut s = Spring::new(1.0, close);
+        s.step(0.0, 0.05);
+        let falling = s.v;
+        assert!(falling < 0.0);
+        let mut caught = Spring { pull: open.0, friction: open.1, ..s };
+        caught.step(1.0, 1.0 / 60.0);
+        assert!(caught.v > falling); // turns round smoothly from the speed it had, no jump
+        let mut slow = Spring::new(0.0, open);
+        slow.step(1.0, 1.0); // a one-second stall
+        assert!(slow.x.is_finite() && slow.x.abs() < 2.0);
+    }
+
+    #[test]
+    fn motion_helpers() {
         assert!(ease_out(0.0).abs() < 0.001 && (ease_out(1.0) - 1.0).abs() < 0.001);
         assert_eq!(mix(10, 20, 0.5), 15);
     }
