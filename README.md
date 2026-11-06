@@ -22,6 +22,7 @@ Rivulet sorts your desktop icons by type into a slim rail of labels on the left.
 - **Folder portals** add a label for any folder, such as Downloads or a cloud folder, without moving anything. Scroll through it, open subfolders inside the panel, and go Back or Up.
 - **A dot** on a label means something new arrived that you have not looked at. Open the section and each new item has a patch of the section's colour and the same dot, until the next time you open it.
 - **Drag an icon onto a label** to file it there for good.
+- **Drag a label up or down the rail** to reorder it: it lifts off, the others slide aside, and it settles into its new place. Recent stays at the top and Settings at the bottom.
 - **Ctrl+Alt+D** shows the desktop with your last section open. Press again to go back.
 - **A Settings label** for themes, labels on the left or right, animation speed and style, and more.
 - **Double-click empty desktop** to hide the labels for a completely clean screen, and again to bring them back.

@@ -573,6 +573,15 @@ pub fn move_section(text: &str, name: &str, by: i32) -> String {
     set_order(text, &order)
 }
 
+/// Move a section to where `onto` is on the rail, as dragging its label there does.
+pub fn move_section_to(text: &str, name: &str, onto: &str) -> String {
+    let mut order = section_order(text);
+    let (Some(from), Some(to)) = (order.iter().position(|s| s == name), order.iter().position(|s| s == onto)) else { return text.to_string() };
+    let moved = order.remove(from);
+    order.insert(to, moved);
+    set_order(text, &order)
+}
+
 /// Put a section into tabs with the one above it on the rail, or take it out of its tabs.
 pub fn toggle_tab(text: &str, name: &str) -> String {
     let mut in_group = false;
@@ -903,6 +912,10 @@ mod tests {
         let down = parse_config(&move_section(EDITABLE, "PDF", 1)).unwrap();
         assert_eq!(down.order, vec!["Word", "Notes", "PDF", "Other"]);
         assert_eq!(move_section(EDITABLE, "Word", -1), EDITABLE); // already at the top
+        let order = |t: &str| parse_config(t).unwrap().order;
+        assert_eq!(order(&move_section_to(EDITABLE, "Other", "Word")), ["Other", "Word", "PDF", "Notes"]);
+        assert_eq!(order(&move_section_to(EDITABLE, "Word", "Notes")), ["PDF", "Notes", "Word", "Other"]);
+        assert_eq!(move_section_to(EDITABLE, "Word", "Nope"), EDITABLE);
     }
 
     #[test]

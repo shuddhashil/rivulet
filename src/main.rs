@@ -850,6 +850,10 @@ enum Command {
     /// The button came up on a file without a drag.
     FileRelease(POINT),
     HoverOpen(String),
+    /// A label is being dragged along the rail: show it where it would land, over this label.
+    ReorderOver(String, String, usize),
+    /// The dragged label was let go over this label: move its section there.
+    ReorderDrop(String, String),
     HoverClose,
     Scroll(i32),
     Answered(Ask, String),
@@ -911,6 +915,8 @@ struct Sections {
     /// Names new to the open section when it opened (or that arrived while open), and which section that is.
     fresh: HashSet<String>,
     fresh_for: Option<String>,
+    /// The rail as it was before a label was picked up, while one is being dragged.
+    reorder_base: Option<Vec<layers::Pill>>,
     last_plan: Option<Plan>,
     last_section: Option<String>,
     shortcut_showing: bool,
@@ -982,6 +988,9 @@ impl Sections {
 
     /// Draw the rail and remember where each label is for clicks.
     unsafe fn show_rail(&self, plan: &Plan) {
+        if REORDERING.load(Ordering::Relaxed) && self.reorder_base.is_some() {
+            return; // a label is being dragged: the rail shows the drag until it is let go
+        }
         if self.rail_hidden {
             LABELS.lock().unwrap().clear();
             layers::hide_rail();
@@ -1524,6 +1533,9 @@ impl Sections {
             }
             neck_point(plan, r);
             self.draw_open(plan, at, r, ease_out((progress * 2.2).min(1.0)));
+            if REORDERING.load(Ordering::Relaxed) {
+                break; // a label is being dragged: settle at once so the rail can show it
+            }
             if let (false, Some((rail, label, panel))) = (opening, self.fold_watch) {
                 let mut pt = POINT { x: 0, y: 0 };
                 GetCursorPos(&mut pt);
@@ -1708,6 +1720,14 @@ impl Sections {
                         self.show_rail(&plan);
                         self.sync_settings(&plan);
                         self.flow(&plan, at, true, None);
+                        if REORDERING.load(Ordering::Relaxed) {
+                            // the press became a drag of the label: the panel simply goes, with nothing
+                            // more to set up, so the rail can follow the drag at once
+                            self.close_open(&plan, false);
+                            *PANEL_ON_SCREEN.lock().unwrap() = None;
+                            let _ = std::fs::write(open_file(), "");
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -2374,7 +2394,7 @@ unsafe fn restore_spacing(desk: &Desktop) {
 fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Command>, window: usize) {
     unsafe {
         let last_section = open.clone();
-        let mut s = Sections { desk, open, hover: None, hidden: vec![], count: 0, seen: None, fresh: HashSet::new(), fresh_for: None, last_plan: None, last_section, shortcut_showing: false, rail_hidden: false, login: login_is_on(), tinted_for: String::from("\0"), main_window: window, icons: HashMap::new(), last_file_click: None, fold_watch: None, fold_back: None, selected: vec![], anchor: -1, scroll: HashMap::new(), nav: HashMap::new(), query: String::new(), find_from: None, screens_seen: String::new(), last_near: Instant::now(), faded: false };
+        let mut s = Sections { desk, open, hover: None, hidden: vec![], count: 0, seen: None, fresh: HashSet::new(), fresh_for: None, reorder_base: None, last_plan: None, last_section, shortcut_showing: false, rail_hidden: false, login: login_is_on(), tinted_for: String::from("\0"), main_window: window, icons: HashMap::new(), last_file_click: None, fold_watch: None, fold_back: None, selected: vec![], anchor: -1, scroll: HashMap::new(), nav: HashMap::new(), query: String::new(), find_from: None, screens_seen: String::new(), last_near: Instant::now(), faded: false };
         CoInitializeEx(std::ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32); // file icons and opening files ask for it
         if let Err(e) = s.settle() {
             log(&format!("first sort failed: {e}"));
@@ -2396,6 +2416,27 @@ fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Com
                 Ok(Command::Hover(name)) => {
                     s.hover(name);
                     Ok(())
+                }
+                // the mouse has already moved on: skip straight to the newest, so every label moves at once
+                Ok(Command::ReorderOver(_, _, seq)) if seq != REORDER_SEQ.load(Ordering::Relaxed) => Ok(()),
+                Ok(Command::ReorderOver(name, onto, _)) => {
+                    let base = s.reorder_base.get_or_insert_with(|| layers::PILLS.lock().unwrap().clone());
+                    // the dragged label is under the mouse, so its place on the rail is left open
+                    let wanted: Vec<layers::Pill> = reorder_preview(base, &name, &onto).into_iter().filter(|p| p.name != name).collect();
+                    slide_pills(wanted);
+                    Ok(())
+                }
+                Ok(Command::ReorderDrop(name, onto)) => {
+                    let base = s.reorder_base.take();
+                    if name == onto {
+                        if let Some(base) = base {
+                            *layers::PILLS.lock().unwrap() = base;
+                            layers::repaint_rail();
+                        }
+                        Ok(())
+                    } else {
+                        s.edit_file(|t| move_section_to(t, &name, &onto)) // redraws the rail in its new order
+                    }
                 }
                 Ok(Command::Filed(section)) => s.file_selected(section),
                 Ok(Command::SettingsClick(pt, ctrl, shift)) => s.settings_click(pt, ctrl, shift),
@@ -2602,6 +2643,118 @@ unsafe fn over_desktop(pt: POINT) -> bool {
     matches!(class.as_str(), "SysListView32" | "SHELLDLL_DefView" | "WorkerW" | "Progman" | "DesktopSectionsLayer")
 }
 
+/// The rail with `name` moved to where `onto` is: the labels keep their places on screen and the
+/// sections shift through them. Recent and Settings stay where they are.
+fn reorder_preview(base: &[layers::Pill], name: &str, onto: &str) -> Vec<layers::Pill> {
+    let slots: Vec<usize> = (0..base.len()).filter(|&i| base[i].name != RECENT && base[i].name != SETTINGS).collect();
+    let mut order = slots.clone();
+    let (Some(from), Some(to)) = (order.iter().position(|&i| base[i].name == name), order.iter().position(|&i| base[i].name == onto)) else { return base.to_vec() };
+    let moved = order.remove(from);
+    order.insert(to, moved);
+    let mut out = base.to_vec();
+    for (&slot, &was) in slots.iter().zip(&order) {
+        out[slot] = layers::Pill { rect: base[slot].rect, hover: base[was].name == name, ..base[was].clone() };
+    }
+    out
+}
+
+/// The labels glide from where they are now to `wanted`, quickly, as a drag passes over them.
+/// A newer move of the drag cuts this short and carries on from wherever they had got to.
+unsafe fn slide_pills(wanted: Vec<layers::Pill>) {
+    let seq = REORDER_SEQ.load(Ordering::Relaxed);
+    let from: HashMap<String, i32> = layers::PILLS.lock().unwrap().iter().map(|p| (p.name.clone(), p.rect.top)).collect();
+    let began = Instant::now();
+    loop {
+        let t = (began.elapsed().as_secs_f32() / 0.14).min(1.0);
+        let k = ease_out(t);
+        let frame: Vec<layers::Pill> = wanted
+            .iter()
+            .map(|p| {
+                let top = from.get(&p.name).map_or(p.rect.top, |&y| mix(y, p.rect.top, k));
+                layers::Pill { rect: RECT { top, bottom: top + p.rect.bottom - p.rect.top, ..p.rect }, ..p.clone() }
+            })
+            .collect();
+        *layers::PILLS.lock().unwrap() = frame;
+        layers::repaint_rail();
+        if t >= 1.0 || REORDER_SEQ.load(Ordering::Relaxed) != seq {
+            break;
+        }
+        if DwmFlush() != 0 {
+            std::thread::sleep(Duration::from_millis(8));
+        }
+    }
+}
+
+static REORDER_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// A label pressed, where, and (once it has moved far enough to be a drag) the label it is over.
+static LABEL_PRESS: Mutex<Option<(String, POINT)>> = Mutex::new(None);
+static REORDER_ONTO: Mutex<Option<String>> = Mutex::new(None);
+static REORDERING: AtomicBool = AtomicBool::new(false);
+
+/// Dragging a pressed label up or down the rail. Only the mouse hook touches these, so no waiting.
+fn reorder_moved(pt: POINT) {
+    let press = LABEL_PRESS.lock().unwrap();
+    let Some((name, from)) = press.as_ref() else { return };
+    if !REORDERING.load(Ordering::Relaxed) {
+        if (pt.y - from.y).abs() < 8 {
+            return;
+        }
+        REORDERING.store(true, Ordering::Relaxed);
+        send(Command::Close); // the press opened it; a drag means moving the label instead
+    }
+    let Ok(labels) = LABELS.try_lock() else { return }; // busy: the next move asks again
+    let Some(rect) = labels.iter().find(|l| &l.name == name).map(|l| l.rect) else { return };
+    // the label lifts off the rail and follows the mouse up and down, staying on the rail
+    let held = POINT { x: from.x, y: pt.y };
+    unsafe {
+        if ghost::lift_label(rect, *from) {
+            ghost::move_label(held);
+        }
+    }
+    // it takes the place whose middle is nearest its own middle, wherever it was picked up
+    let middle = pt.y - (from.y - rect.top) + (rect.bottom - rect.top) / 2;
+    let onto = labels
+        .iter()
+        .filter(|l| l.name != RECENT && l.name != SETTINGS)
+        .min_by_key(|l| ((l.rect.top + l.rect.bottom) / 2 - middle).abs())
+        .map(|l| l.name.clone());
+    drop(labels);
+    if let Some(onto) = onto {
+        let mut last = REORDER_ONTO.lock().unwrap();
+        if last.as_ref() != Some(&onto) {
+            *last = Some(onto.clone());
+            let seq = REORDER_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+            send(Command::ReorderOver(name.clone(), onto, seq));
+        }
+    }
+}
+
+/// The button came up: drop a dragged label. True if one was being dragged.
+fn reorder_released() -> bool {
+    let press = LABEL_PRESS.lock().unwrap().take();
+    let onto = REORDER_ONTO.lock().unwrap().take();
+    if !REORDERING.swap(false, Ordering::Relaxed) {
+        unsafe { ghost::drop_label() };
+        return false;
+    }
+    if let Some((name, _)) = press {
+        let onto = onto.unwrap_or_else(|| name.clone());
+        // it lands where the label it was dropped on stood
+        let place = LABELS.try_lock().ok().and_then(|l| l.iter().find(|l| l.name == onto).map(|l| l.rect));
+        unsafe {
+            match place {
+                Some(rect) => ghost::settle_label(rect),
+                None => ghost::drop_label(),
+            }
+        }
+        send(Command::ReorderDrop(name, onto));
+    } else {
+        unsafe { ghost::drop_label() };
+    }
+    true
+}
+
 fn label_at(pt: POINT) -> Option<String> {
     let labels = LABELS.try_lock().ok()?;
     let inside = |r: &RECT| pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;
@@ -2696,6 +2849,9 @@ unsafe fn left_down(pt: POINT) -> bool {
     }
     let hover_section = HOVER_SECTION.try_lock().ok().and_then(|mut h| h.take());
     if let Some(name) = label_at(pt) {
+        if name != RECENT && name != SETTINGS {
+            *LABEL_PRESS.lock().unwrap() = Some((name.clone(), pt)); // it may become a drag along the rail
+        }
         if hover_section.as_deref() == Some(name.as_str()) {
             if let Ok(mut o) = OPENED_BY_HOVER.try_lock() {
                 *o = None;
@@ -2708,6 +2864,7 @@ unsafe fn left_down(pt: POINT) -> bool {
             *last = Some(Instant::now());
             send(Command::Toggle(name));
         }
+        return true; // the desktop must not start a selection box under a label being dragged
     } else if in_panel(pt) {
         if SETTINGS_OPEN.load(Ordering::Relaxed) {
             // hover_section has been cleared: a click inside means the section is in use
@@ -2776,6 +2933,10 @@ fn has_left_hover_section(pt: POINT) -> bool {
 }
 
 fn mouse_moved(pt: POINT) {
+    reorder_moved(pt);
+    if REORDERING.load(Ordering::Relaxed) {
+        return; // the rail shows the drag; nothing should open or highlight under it meanwhile
+    }
     if has_left_hover_section(pt) && !LEAVING.swap(true, Ordering::Relaxed) {
         // a short grace, so slipping out for a moment or cutting a corner does not close it
         std::thread::spawn(|| {
@@ -2876,6 +3037,9 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
             }
             WM_LBUTTONUP => {
                 if SWALLOW_RELEASE.swap(false, Ordering::Relaxed) {
+                    if reorder_released() {
+                        return 1;
+                    }
                     let dragged = ghost::release();
                     box_ended();
                     if let Some((names, paths)) = DRAG_ITEMS.try_lock().ok().and_then(|mut d| d.take()) {

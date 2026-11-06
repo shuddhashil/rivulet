@@ -30,6 +30,7 @@ static PILL_TINT: AtomicU32 = AtomicU32::new(0x00261A12);
 static PANEL_TINT: AtomicU32 = AtomicU32::new(0x00160E0A);
 static ACCENT: AtomicU32 = AtomicU32::new(0x00F0A040);
 
+#[derive(Clone)]
 pub struct Pill {
     pub name: String,
     /// No number is shown for 0, as on the Settings label.
