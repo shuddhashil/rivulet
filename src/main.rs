@@ -908,6 +908,9 @@ struct Sections {
     hidden: Vec<usize>,
     count: usize,
     seen: Option<HashSet<String>>,
+    /// Names new to the open section when it opened (or that arrived while open), and which section that is.
+    fresh: HashSet<String>,
+    fresh_for: Option<String>,
     last_plan: Option<Plan>,
     last_section: Option<String>,
     shortcut_showing: bool,
@@ -956,8 +959,18 @@ impl Sections {
             Err(_) => all.iter().cloned().collect(),
         });
         let before = seen.len();
+        let open_name = open_at.map(|at| plan.groups[at].0.clone());
+        if open_name != self.fresh_for {
+            self.fresh.clear();
+            self.fresh_for = open_name;
+        }
         if let Some(at) = open_at {
-            seen.extend(names(&plan.groups[at].1));
+            let now = names(&plan.groups[at].1);
+            // noted before they count as seen, so the panel can still show which they were
+            if plan.cfg.dots {
+                self.fresh.extend(now.iter().filter(|n| !seen.contains(*n)).cloned());
+            }
+            seen.extend(now);
         }
         // names are never dropped: the icon list briefly empties during a refresh, and that must
         // not make everything look new afterwards
@@ -1066,6 +1079,15 @@ impl Sections {
                 layers::set_tints(layers::pill_tint(), chosen);
             }
             self.tinted_for = if read { now } else { String::from(" ") };
+        }
+    }
+
+    unsafe fn warm_icons(&mut self) {
+        let Ok(plan) = self.current_plan() else { return };
+        for (at, (name, _)) in plan.groups.iter().enumerate() {
+            if let (true, Some((_, grid))) = (plan.draws_files(name), plan.file_layout(at)) {
+                self.file_panel(&plan, at, name, grid);
+            }
         }
     }
 
@@ -1292,6 +1314,8 @@ impl Sections {
         // the list may have changed, so find the selected file again and let hover be found afresh
         let selected: Vec<i32> = items.iter().enumerate().filter(|(_, i)| matches!(&i.action, Some(Action::Open(p)) if self.selected.contains(p))).map(|(n, _)| n as i32).collect();
         *layers::SELECTED_ITEMS.lock().unwrap() = selected;
+        let fresh = if self.fresh_for.as_deref() == self.open.as_deref() { items.iter().enumerate().filter(|(_, i)| matches!(&i.look, Look::File(n, _) if self.fresh.contains(&n.to_lowercase()))).map(|(n, _)| n as i32).collect() } else { vec![] };
+        *layers::FRESH_ITEMS.lock().unwrap() = fresh;
         layers::HOVER_ITEM.store(-1, Ordering::Relaxed);
         // a panel of Rivulet's own controls, so clicks in it come here and not to the desktop
         SETTINGS_OPEN.store(!items.is_empty(), Ordering::Relaxed);
@@ -1677,6 +1701,7 @@ impl Sections {
                     self.last_section = Some(name.clone());
                 }
                 self.open = Some(name);
+                self.update_seen(&plan, Some(at)); // the new files are noted now, so they show marked as it opens
                 match slide_from {
                     Some(from) => self.slide(&plan, from, at),
                     None => {
@@ -2349,7 +2374,7 @@ unsafe fn restore_spacing(desk: &Desktop) {
 fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Command>, window: usize) {
     unsafe {
         let last_section = open.clone();
-        let mut s = Sections { desk, open, hover: None, hidden: vec![], count: 0, seen: None, last_plan: None, last_section, shortcut_showing: false, rail_hidden: false, login: login_is_on(), tinted_for: String::from("\0"), main_window: window, icons: HashMap::new(), last_file_click: None, fold_watch: None, fold_back: None, selected: vec![], anchor: -1, scroll: HashMap::new(), nav: HashMap::new(), query: String::new(), find_from: None, screens_seen: String::new(), last_near: Instant::now(), faded: false };
+        let mut s = Sections { desk, open, hover: None, hidden: vec![], count: 0, seen: None, fresh: HashSet::new(), fresh_for: None, last_plan: None, last_section, shortcut_showing: false, rail_hidden: false, login: login_is_on(), tinted_for: String::from("\0"), main_window: window, icons: HashMap::new(), last_file_click: None, fold_watch: None, fold_back: None, selected: vec![], anchor: -1, scroll: HashMap::new(), nav: HashMap::new(), query: String::new(), find_from: None, screens_seen: String::new(), last_near: Instant::now(), faded: false };
         CoInitializeEx(std::ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32); // file icons and opening files ask for it
         if let Err(e) = s.settle() {
             log(&format!("first sort failed: {e}"));
@@ -2358,6 +2383,7 @@ fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Com
             return;
         }
         log("running");
+        s.warm_icons(); // so no section's first opening waits on Windows for its icons
         let mut last_check = Instant::now();
         // to see the folders change while Explorer's list does not
         let (mut dirs_before, mut count_before, mut waiting) = (desktop_dirs_stamp(), s.desk.count(), None);
@@ -2538,7 +2564,7 @@ fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Com
 static DRAG_FROM_PANEL: AtomicBool = AtomicBool::new(false);
 static SETTINGS_OPEN: AtomicBool = AtomicBool::new(false);
 /// Files fly in over this many times the panel's opening time, so each flight can be followed.
-const FLOAT_LONGER: f32 = 2.5;
+const FLOAT_LONGER: f32 = 1.8;
 /// A section closes in its style over this many times the opening time: quicker than it opened.
 const CLOSE_LONGER: f32 = 1.5;
 /// Never quicker than this, even at the fast speed, or the style cannot be seen leaving.
@@ -2807,7 +2833,7 @@ fn mouse_moved(pt: POINT) {
                 // only if the mouse is still resting there; carrying files it waits longer, so a quick
                 // drop on the label still files them there, and resting opens it to drop inside
                 std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(if carrying { 600 } else { 350 }));
+                    std::thread::sleep(Duration::from_millis(if carrying { 600 } else { 120 }));
                     let same = HOVERING.lock().is_ok_and(|h| h.as_deref() == Some(name.as_str()));
                     if same && ghost::dragging() == carrying {
                         send(Command::HoverOpen(name));

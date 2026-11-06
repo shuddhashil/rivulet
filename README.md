@@ -20,10 +20,10 @@ Rivulet sorts your desktop icons by type into a slim rail of labels on the left.
 - Sections by file type: Folders, Word, Excel, PowerPoint, PDF, Notes, Code, Apps, Zips.
 - **Recent** shows what you created or changed in the last 3 days, wherever it belongs.
 - **Folder portals** add a label for any folder, such as Downloads or a cloud folder, without moving anything. Scroll through it, open subfolders inside the panel, and go Back or Up.
-- **A dot** on a label means something new arrived that you have not looked at.
+- **A dot** on a label means something new arrived that you have not looked at. Open the section and each new item has a patch of the section's colour and the same dot, until the next time you open it.
 - **Drag an icon onto a label** to file it there for good.
 - **Ctrl+Alt+D** shows the desktop with your last section open. Press again to go back.
-- **A Settings label** for themes, labels on the left or right, animation speed, and more.
+- **A Settings label** for themes, labels on the left or right, animation speed and style, and more.
 - **Double-click empty desktop** to hide the labels for a completely clean screen, and again to bring them back.
 - **Six styles.** Plain is the default and uses 2-3 MB. Smooth adds soft corners and shadows (60-90 MB). Glass is frosted glass made from your own wallpaper (55-100 MB). Liquid is clear glass drawn by a shader on the graphics card: the wallpaper bends through the rim with a touch of colour fringing, the panel, neck and label melt into one shape, the light follows your mouse, and the glass deepens over bright wallpaper so text stays readable (80-130 MB). Aurora fills the glass with slow curtains of colour from your wallpaper and sections, moving only while a section is open or the mouse is near. Neon is dark glass with a lit tube round each edge in the section's colour, spilling light that brightens as the mouse comes close. All but Plain need the graphics card; with Plain, those libraries are never loaded.
 - Colours per section, five themes, and tints that follow your wallpaper.
@@ -46,6 +46,21 @@ Set **Settings > General > Icons** to Rivulet and it draws your icons itself, so
 - **Sections:** add, rename, reorder, recolour or remove sections, choose symbols, add folder portals and join tabs, without editing any text.
 - **Rules:** add or remove rules, including `size>100mb` and `age<7d` as well as name patterns.
 - **Layouts:** save and switch named layouts (Ctrl+Alt+Page Up / Down), and optionally keep one for each screen setup.
+
+### Animation styles
+
+Set **Settings > General > Animation style** to choose how a section opens and closes. Each style moves the panel and its files together:
+
+| Style | Opening | Closing |
+|---|---|---|
+| **Pour** (default) | The panel pours out of the label through the curved neck, and each file lifts into its place | Folds back into the label |
+| **Unfold** | The panel opens downwards one fold at a time, like paper, and each icon swings open on a hinge | The icons swing shut, then the panel folds back up |
+| **Curtain** | A lit circle spreads across the panel from the neck, uncovering each file as it passes | The circle shrinks back into the neck |
+| **Pop** | The panel springs out like a bubble, a little past full size, and the files pop in from the middle outwards | The files shrink away, then the bubble swells slightly and is drawn back into the label |
+| **Drift** | The panel fades in, settling from just above, and the files fall into place, swaying like leaves | The files fall away downwards, then the panel sinks and fades |
+| **Trace** | A lit line draws the panel's outline outwards from the neck, the glass fills, then the files light up | The files go dark, the glass empties, and the outline draws back into the neck |
+
+The styles work with the Liquid, Aurora, Neon and Clear looks. Plain, Smooth and Glass always use Pour. **Animation speed** sets how quickly they run; at Fast, closing still takes at least a third of a second so the style can be seen. In `sections.ini` the setting is `entrance = pour` (or `unfold`, `curtain`, `pop`, `drift`, `trace`) under `[general]`.
 
 ## Install
 
@@ -130,6 +145,7 @@ This is an early release, so please read this.
 - It relies on undocumented Windows behaviour, so a Windows update could break it.
 - Portals show a folder's newest 24 files and open them on a double-click. They have no right-click menu or drag and drop yet, and they refresh when opened.
 - One section opens at a time, and a section cannot hold more icons than fit on the screen.
+- If the mouse comes back to a section while it is closing, it reopens, but that close uses the Pour motion whatever the animation style.
 
 If something breaks, run `rivulet.exe --doctor` and [open an issue](../../issues/new/choose) with the report. It contains no file names.
 

@@ -48,6 +48,19 @@ pub static SETTINGS_ITEMS: Mutex<Vec<Item>> = Mutex::new(Vec::new());
 /// Indices into SETTINGS_ITEMS, or -1 for none.
 pub static HOVER_ITEM: AtomicI32 = AtomicI32::new(-1);
 pub static SELECTED_ITEMS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+/// Files that arrived since the section was last opened: they carry the label's dot and a patch of its colour.
+pub static FRESH_ITEMS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+/// A new file's mark: a patch of the section colour behind it, brightest as it arrives, and the
+/// label's dot at its corner. `shown` fades it in with the file.
+fn fresh_mark(c: &mut dyn Canvas, patch: RECT, radius: i32, dot: (i32, i32), dpi: f32, accent: u32, own: f32, shown: f32) {
+    let glow = (std::f32::consts::PI * own.clamp(0.0, 1.0)).sin();
+    c.wash(patch, radius, accent, ((60.0 + 90.0 * glow) * shown) as u8);
+    let size = (8.0 * dpi) as i32;
+    let (x, y) = dot;
+    c.wash(RECT { left: x - 1, top: y - 1, right: x + size + 1, bottom: y + size + 1 }, size + 2, WHITE, (255.0 * shown) as u8);
+    c.wash(RECT { left: x, top: y, right: x + size, bottom: y + size }, size, accent, (255.0 * shown) as u8);
+}
 /// The selection box being drawn, inside the panel.
 pub static SELECT_BOX: Mutex<Option<RECT>> = Mutex::new(None);
 
@@ -675,6 +688,7 @@ pub fn paint_settings_on(c: &mut dyn Canvas, dpi: f32, base: u32, accent: u32) {
     let radius = (10.0 * dpi) as i32;
     let idle = blend(base, WHITE, 0.10);
     let chosen = SELECTED_ITEMS.lock().map(|s| s.clone()).unwrap_or_default();
+    let fresh = FRESH_ITEMS.lock().map(|s| s.clone()).unwrap_or_default();
     if let Ok(items) = SETTINGS_ITEMS.lock() {
         let reveal = reveal_plan(&items);
         for (index, item) in items.iter().enumerate() {
@@ -702,6 +716,10 @@ pub fn paint_settings_on(c: &mut dyn Canvas, dpi: f32, base: u32, accent: u32) {
                     let size = crate::settings::list_icon_pixels(dpi);
                     let side = (8.0 * dpi) as i32;
                     let f = flight(own, (r.left + side + size / 2, r.top + (r.bottom - r.top) / 2), size);
+                    if fresh.contains(&(index as i32)) {
+                        let patch = RECT { left: r.left + inset, top: r.top + inset / 2, right: r.right - inset, bottom: r.bottom - inset / 2 };
+                        fresh_mark(c, patch, (6.0 * dpi) as i32, (r.left + side + size - (2.0 * dpi) as i32, r.top + (2.0 * dpi) as i32), dpi, accent, own, f.icon);
+                    }
                     c.set_fade(f.icon);
                     c.icon_soft(f.x - f.size / 2, f.y - f.size / 2, f.size, *icon, f.wide);
                     if f.name > 0.0 {
@@ -728,6 +746,11 @@ pub fn paint_settings_on(c: &mut dyn Canvas, dpi: f32, base: u32, accent: u32) {
                     let size = crate::settings::icon_pixels(dpi);
                     let top = r.top + (6.0 * dpi) as i32;
                     let f = flight(own, ((r.left + r.right) / 2, top + size / 2), size);
+                    if fresh.contains(&(index as i32)) {
+                        let inset = (3.0 * dpi) as i32;
+                        let patch = RECT { left: r.left + inset, top: r.top + inset, right: r.right - inset, bottom: r.bottom - inset };
+                        fresh_mark(c, patch, (10.0 * dpi) as i32, (r.right - (14.0 * dpi) as i32, r.top + (7.0 * dpi) as i32), dpi, accent, own, f.icon);
+                    }
                     c.set_fade(f.icon);
                     c.icon_soft(f.x - f.size / 2, f.y - f.size / 2, f.size, *icon, f.wide);
                     if f.name > 0.0 {
