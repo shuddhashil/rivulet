@@ -531,6 +531,7 @@ unsafe fn cached_icon(icons: &mut HashMap<PathBuf, (u64, isize)>, path: &Path, s
             return icon;
         }
         DestroyIcon(icon as HICON);
+        pretty::forget_icon(icon);
     }
     let icon = file_icon(path, side);
     icons.insert(path.to_path_buf(), (changed, icon));
@@ -784,7 +785,7 @@ unsafe fn make_plan(desk: &Desktop, cfg: &Config) -> Result<Plan, String> {
             wide_spacing,
             pad: scaled(6.0),
             gap: scaled(10.0),
-            pill_h: scaled(32.0),
+            pill_h: scaled(cfg.label_height as f32),
             pill_gap: scaled(4.0),
             rail_w: scaled(168.0),
             bridge: scaled(76.0),
@@ -824,6 +825,8 @@ struct Label {
 }
 
 static LABELS: Mutex<Vec<Label>> = Mutex::new(Vec::new());
+/// The section a rest on its label has asked to open, until the worker takes it up.
+static OPEN_WAITING: Mutex<Option<String>> = Mutex::new(None);
 static PANEL_ON_SCREEN: Mutex<Option<RECT>> = Mutex::new(None);
 static COMMANDS: OnceLock<Sender<Command>> = OnceLock::new();
 static CHANGE_WAITING: AtomicBool = AtomicBool::new(false);
@@ -927,7 +930,7 @@ struct Sections {
     icons: HashMap<PathBuf, (u64, isize)>,
     last_file_click: Option<(Instant, PathBuf)>,
     /// While a hover-opened section folds: its rail, label and full panel on screen, to see the mouse come back.
-    fold_watch: Option<(RECT, RECT, RECT)>,
+    fold_watch: Option<(RECT, RECT)>,
     /// The fold was cut short because the mouse came back; how far open it still was.
     fold_back: Option<Spring>,
     selected: Vec<PathBuf>,
@@ -943,6 +946,8 @@ struct Sections {
     screens_seen: String,
     last_near: Instant,
     faded: bool,
+    /// where a glide was cut short to go on to another section: panel, neck height, colour
+    cut: Option<(Rect, i32, u32)>,
 }
 
 unsafe fn load_plan(desk: &Desktop) -> Result<Plan, String> {
@@ -1020,6 +1025,11 @@ impl Sections {
         }
         *layers::PILLS.lock().unwrap() = pills;
         *LABELS.lock().unwrap() = hits;
+        if !REORDERING.load(Ordering::Relaxed) {
+            let mut pt = POINT { x: 0, y: 0 };
+            GetCursorPos(&mut pt);
+            note_hover(pt);
+        }
         let (lx, ly) = plan.layer_origin;
         layers::show_rail(lx + rail_x, ly + m.gap, m.rail_w + 1, height.max(1), m.radius);
     }
@@ -1110,6 +1120,7 @@ impl Sections {
             let keep = path.to_string_lossy().starts_with("shell:") || path.exists();
             if !keep {
                 DestroyIcon(*icon as HICON);
+                pretty::forget_icon(*icon);
             }
             keep
         });
@@ -1536,13 +1547,13 @@ impl Sections {
             if REORDERING.load(Ordering::Relaxed) {
                 break; // a label is being dragged: settle at once so the rail can show it
             }
-            if let (false, Some((rail, label, panel))) = (opening, self.fold_watch) {
+            if let (false, Some((label, panel))) = (opening, self.fold_watch) {
                 let mut pt = POINT { x: 0, y: 0 };
                 GetCursorPos(&mut pt);
                 if label_at(pt).is_some_and(|n| n != plan.groups[at].0) {
                     break; // on to another section: this one goes now, the next opens without waiting
                 }
-                if keeps_open(pt, rail, label, panel) {
+                if keeps_open(pt, label_at(pt).is_some(), label, panel) {
                     // back again: the same spring turns round, keeping the speed it had
                     self.fold_back = Some(sw);
                     break;
@@ -1703,6 +1714,7 @@ impl Sections {
             layers::HOVER_ITEM.store(-1, Ordering::Relaxed);
             self.open = None;
         } else {
+            self.cut = None;
             self.close_open(&plan, previous.as_deref() == Some(name.as_str()));
         }
         if previous.as_deref() != Some(name.as_str()) {
@@ -1742,6 +1754,8 @@ impl Sections {
         let (Some((old, _)), Some((new, _))) = (plan.panel(from), plan.panel(to)) else { return };
         let (from_y, to_y) = (plan.pill_mid(from), plan.pill_mid(to));
         let (from_colour, to_colour) = (plan.colour(&plan.groups[from].0), plan.colour(&plan.groups[to].0));
+        // carry on from wherever a glide cut short had got to
+        let (old, from_y, from_colour) = self.cut.take().unwrap_or((old, from_y, from_colour));
         let liquid = matches!(plan.cfg.style.as_str(), "liquid" | "aurora" | "neon" | "clear");
         // the move rides a spring a little firmer than opening, so it runs just past and settles back
         let seconds = speed_times(&plan.cfg.speed).0;
@@ -1785,6 +1799,13 @@ impl Sections {
                 frame_report(what, &gaps);
                 break;
             }
+            // the mouse has already rested on another label: stop here and turn towards that one
+            let next = OPEN_WAITING.try_lock().ok().and_then(|w| w.clone());
+            if next.is_some_and(|n| n != plan.groups[to].0 && plan.index(&n).is_some()) {
+                self.cut = Some((r, mix(from_y, to_y, glide), blend(from_colour, to_colour, glide.clamp(0.0, 1.0))));
+                frame_report("slide cut", &gaps);
+                break;
+            }
             if DwmFlush() != 0 {
                 std::thread::sleep(Duration::from_millis(8)); // no composition, so pace by hand
             }
@@ -1805,17 +1826,9 @@ impl Sections {
         let plan = self.current_plan()?;
         let Some(name) = self.open.clone() else { return Ok(()) };
         let (Some(at), Some(panel)) = (plan.index(&name), *PANEL_ON_SCREEN.lock().unwrap()) else { return self.close_at_once() };
-        let (rail, label) = {
-            let labels = LABELS.lock().unwrap();
-            let Some(label) = labels.iter().find(|l| l.name == name).map(|l| l.rect) else { drop(labels); return self.close_at_once() };
-            let mut rail = label;
-            for l in labels.iter() {
-                rail.top = rail.top.min(l.rect.top);
-                rail.bottom = rail.bottom.max(l.rect.bottom);
-            }
-            (rail, label)
-        };
-        self.fold_watch = Some((rail, label, panel));
+        let label = LABELS.lock().unwrap().iter().find(|l| l.name == name).map(|l| l.rect);
+        let Some(label) = label else { return self.close_at_once() };
+        self.fold_watch = Some((label, panel));
         self.close_open(&plan, true);
         self.fold_watch = None;
         if let Some(start) = self.fold_back.take() {
@@ -2394,7 +2407,7 @@ unsafe fn restore_spacing(desk: &Desktop) {
 fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Command>, window: usize) {
     unsafe {
         let last_section = open.clone();
-        let mut s = Sections { desk, open, hover: None, hidden: vec![], count: 0, seen: None, fresh: HashSet::new(), fresh_for: None, reorder_base: None, last_plan: None, last_section, shortcut_showing: false, rail_hidden: false, login: login_is_on(), tinted_for: String::from("\0"), main_window: window, icons: HashMap::new(), last_file_click: None, fold_watch: None, fold_back: None, selected: vec![], anchor: -1, scroll: HashMap::new(), nav: HashMap::new(), query: String::new(), find_from: None, screens_seen: String::new(), last_near: Instant::now(), faded: false };
+        let mut s = Sections { desk, open, hover: None, hidden: vec![], count: 0, seen: None, fresh: HashSet::new(), fresh_for: None, reorder_base: None, last_plan: None, last_section, shortcut_showing: false, rail_hidden: false, login: login_is_on(), tinted_for: String::from("\0"), main_window: window, icons: HashMap::new(), last_file_click: None, fold_watch: None, fold_back: None, selected: vec![], anchor: -1, scroll: HashMap::new(), nav: HashMap::new(), query: String::new(), find_from: None, screens_seen: String::new(), last_near: Instant::now(), faded: false, cut: None };
         CoInitializeEx(std::ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32); // file icons and opening files ask for it
         if let Err(e) = s.settle() {
             log(&format!("first sort failed: {e}"));
@@ -2489,6 +2502,7 @@ fn worker(desk: Desktop, open: Option<String>, rx: std::sync::mpsc::Receiver<Com
                     Ok(())
                 }
                 Ok(Command::HoverOpen(name)) => {
+                    *OPEN_WAITING.lock().unwrap() = None;
                     if s.open.as_deref() == Some(name.as_str()) {
                         Ok(())
                     } else {
@@ -2910,11 +2924,13 @@ unsafe fn left_up(pt: POINT) {
 
 /// Whether the mouse is on the way between a section's parts: the labels, the panel, or the gap
 /// between the panel and the label it came from.
-fn keeps_open(pt: POINT, rail: RECT, label: RECT, panel: RECT) -> bool {
+fn keeps_open(pt: POINT, on_label: bool, label: RECT, panel: RECT) -> bool {
     let inside = |r: RECT| pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;
-    let (left, right) = if rail.right <= panel.left { (rail.right, panel.left) } else { (panel.right, rail.left) };
+    let (left, right) = if label.right <= panel.left { (label.right, panel.left) } else { (panel.right, label.left) };
     let gap = RECT { left, right, top: label.top.min(panel.top), bottom: label.bottom.max(panel.bottom) };
-    inside(rail) || inside(panel) || inside(gap)
+    // on any label keeps it (resting there opens that one instead); the space between two labels
+    // does not, or a section stays open while the mouse sits in a gap using nothing
+    on_label || inside(label) || inside(panel) || inside(gap)
 }
 
 /// Whether the mouse has left the section that opened by resting on its label. Busy locks count as
@@ -2924,12 +2940,8 @@ fn has_left_hover_section(pt: POINT) -> bool {
     let Some(panel) = PANEL_ON_SCREEN.try_lock().ok().and_then(|p| *p) else { return false };
     let Ok(labels) = LABELS.try_lock() else { return false };
     let Some(label) = labels.iter().find(|l| l.name == name) else { return false };
-    let mut rail = label.rect;
-    for l in labels.iter() {
-        rail.top = rail.top.min(l.rect.top);
-        rail.bottom = rail.bottom.max(l.rect.bottom);
-    }
-    !keeps_open(pt, rail, label.rect, panel)
+    let on_label = labels.iter().any(|l| pt.x >= l.rect.left && pt.x < l.rect.right && pt.y >= l.rect.top && pt.y < l.rect.bottom);
+    !keeps_open(pt, on_label, label.rect, panel)
 }
 
 fn mouse_moved(pt: POINT) {
@@ -2985,6 +2997,13 @@ fn mouse_moved(pt: POINT) {
             send(Command::PanelRepaint); // only on moving to another icon, never within one
         }
     }
+    note_hover(pt);
+}
+
+/// Which label the mouse rests on, and opening it after a short rest. A mouse move asks this, and so
+/// does every rebuild of the labels: after a desktop refresh the labels are briefly gone, and a mouse
+/// that stopped on one meanwhile would otherwise wait for its next move.
+fn note_hover(pt: POINT) {
     let hit = label_at(pt).filter(|_| unsafe { over_desktop(pt) });
     if let Ok(mut hovering) = HOVERING.try_lock() {
         if *hovering != hit {
@@ -2997,6 +3016,7 @@ fn mouse_moved(pt: POINT) {
                     std::thread::sleep(Duration::from_millis(if carrying { 600 } else { 120 }));
                     let same = HOVERING.lock().is_ok_and(|h| h.as_deref() == Some(name.as_str()));
                     if same && ghost::dragging() == carrying {
+                        *OPEN_WAITING.lock().unwrap() = Some(name.clone());
                         send(Command::HoverOpen(name));
                     }
                 });
@@ -3599,17 +3619,18 @@ mod hover_tests {
     #[test]
     fn the_way_from_label_to_panel_keeps_a_section_open() {
         let r = |left, top, right, bottom| RECT { left, top, right, bottom };
-        let (rail, label, panel) = (r(10, 10, 200, 600), r(10, 300, 200, 340), r(300, 100, 900, 500));
+        let (label, panel) = (r(10, 300, 200, 340), r(300, 100, 900, 500));
         let at = |x, y| POINT { x, y };
-        assert!(keeps_open(at(100, 320), rail, label, panel)); // on its label
-        assert!(keeps_open(at(100, 50), rail, label, panel)); // on another label
-        assert!(keeps_open(at(250, 320), rail, label, panel)); // crossing the gap
-        assert!(keeps_open(at(600, 300), rail, label, panel)); // in the panel
-        assert!(!keeps_open(at(1000, 300), rail, label, panel)); // past the panel
-        assert!(!keeps_open(at(600, 700), rail, label, panel)); // below it
+        assert!(keeps_open(at(100, 320), false, label, panel)); // on its label
+        assert!(keeps_open(at(100, 50), true, label, panel)); // on another label
+        assert!(!keeps_open(at(100, 290), false, label, panel)); // resting in the space between two labels
+        assert!(keeps_open(at(250, 320), false, label, panel)); // crossing the gap
+        assert!(keeps_open(at(600, 300), false, label, panel)); // in the panel
+        assert!(!keeps_open(at(1000, 300), false, label, panel)); // past the panel
+        assert!(!keeps_open(at(600, 700), false, label, panel)); // below it
         // with the labels on the right
-        let (rail, label, panel) = (r(1700, 10, 1900, 600), r(1700, 300, 1900, 340), r(900, 100, 1600, 500));
-        assert!(keeps_open(at(1650, 320), rail, label, panel));
-        assert!(!keeps_open(at(500, 320), rail, label, panel));
+        let (label, panel) = (r(1700, 300, 1900, 340), r(900, 100, 1600, 500));
+        assert!(keeps_open(at(1650, 320), false, label, panel));
+        assert!(!keeps_open(at(500, 320), false, label, panel));
     }
 }

@@ -58,11 +58,23 @@ float neck_distance(float2 p) {
     return best;
 }
 
+// No closer than this to the neck: the curve and its chords stay inside the box round its four
+// points, so the distance to that box, less the widest half width, never overshoots.
+float neck_at_least(float2 p) {
+    float2 lo = min(min(neck0.xy, neck0.zw), min(neck1.xy, neck1.zw));
+    float2 hi = max(max(neck0.xy, neck0.zw), max(neck1.xy, neck1.zw));
+    return length(max(max(lo - p, p - hi), 0)) - max(neck2.z, neck2.w);
+}
+
 float glass_distance(float2 p) {
     float d = box_distance(p, box, shape.x);
     if (neck2.x > 0.5) {
         float k = 14 * shape.w;
-        d = melt(d, neck_distance(p), k);
+        // melt(d, n, k) is exactly d once n >= d + k, so the 16-step curve is only walked near the
+        // neck. Walking it for every pixel of a big panel (5 times each) overran the frame.
+        if (neck_at_least(p) < d + k) {
+            d = melt(d, neck_distance(p), k);
+        }
         d = melt(d, box_distance(p, pill, 14 * shape.w), k);
     }
     return d;

@@ -605,6 +605,53 @@ unsafe fn draw_text(t: &TextTarget, r: RECT, text: &str, colour: u32, style: Sty
     }
 }
 
+/// Each icon's pixels at each size, drawn once: an opening redraws every file every frame, and
+/// drawing an icon afresh each time (a new DC, bitmap and DrawIconEx) cost 1-5 ms a frame.
+static ICON_PIXELS: std::sync::Mutex<Option<std::collections::HashMap<(isize, i32), std::sync::Arc<Vec<u32>>>>> = std::sync::Mutex::new(None);
+
+/// An icon handle is going away; its handle number may later belong to another icon.
+pub fn forget_icon(icon: isize) {
+    if let Ok(mut cache) = ICON_PIXELS.lock() {
+        if let Some(c) = cache.as_mut() {
+            c.retain(|k, _| k.0 != icon);
+        }
+    }
+}
+
+unsafe fn icon_pixels_of(icon: isize, size: i32) -> Option<std::sync::Arc<Vec<u32>>> {
+    if let Some(p) = ICON_PIXELS.lock().ok()?.as_ref().and_then(|c| c.get(&(icon, size)).cloned()) {
+        return Some(p);
+    }
+    use windows_sys::Win32::Graphics::Gdi::*;
+    let mut info: BITMAPINFO = std::mem::zeroed();
+    info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    info.bmiHeader.biWidth = size;
+    info.bmiHeader.biHeight = -size;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    let dc = CreateCompatibleDC(std::ptr::null_mut());
+    let mut bits = std::ptr::null_mut();
+    let dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+    let mut out = None;
+    if !dib.is_null() {
+        let old = SelectObject(dc, dib as _);
+        windows_sys::Win32::UI::WindowsAndMessaging::DrawIconEx(dc, 0, 0, icon as _, size, size, 0, std::ptr::null_mut(), windows_sys::Win32::UI::WindowsAndMessaging::DI_NORMAL);
+        out = Some(std::sync::Arc::new(std::slice::from_raw_parts(bits as *const u32, (size * size) as usize).to_vec()));
+        SelectObject(dc, old);
+        DeleteObject(dib as _);
+    }
+    DeleteDC(dc);
+    let pixels = out?;
+    if let Ok(mut cache) = ICON_PIXELS.lock() {
+        let c = cache.get_or_insert_with(Default::default);
+        if c.len() > 600 {
+            c.clear(); // ponytail: wholesale reset bounds memory; an LRU only if sections hold hundreds of files
+        }
+        c.insert((icon, size), pixels.clone());
+    }
+    Some(pixels)
+}
+
 /// How visible what is drawn next is, 0 to 256: files flying in fade their icon and name with it.
 static DRAW_FADE: AtomicU32 = AtomicU32::new(256);
 
@@ -619,6 +666,42 @@ fn faded(px: u32, fade: u32) -> u32 {
     }
     let ch = |shift: u32| ((((px >> shift) & 0xFF) * fade) >> 8) << shift;
     ch(0) | ch(8) | ch(16) | ch(24)
+}
+
+/// A picture the processor rewrites every frame. DYNAMIC + Map(DISCARD) hands back fresh memory at
+/// once; UpdateSubresource on a DEFAULT texture stalled 10-21 ms while the card still read last frame's.
+unsafe fn frame_texture(device: &ID3D11Device, w: i32, h: i32) -> Option<(ID3D11Texture2D, ID3D11ShaderResourceView)> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: w as u32,
+        Height: h as u32,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_DYNAMIC,
+        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+        ..Default::default()
+    };
+    let (mut texture, mut view) = (None, None);
+    device.CreateTexture2D(&desc, None, Some(&mut texture)).ok()?;
+    let texture = texture?;
+    device.CreateShaderResourceView(&texture, None, Some(&mut view)).ok()?;
+    Some((texture, view?))
+}
+
+/// Copy the top-left `w` x `h` of a page (rows `stride` wide) into a frame texture. Only that corner is
+/// drawn; the page keeps spare room for growing, which need not travel to the card every frame.
+unsafe fn write_corner(context: &ID3D11DeviceContext, texture: &ID3D11Texture2D, pixels: &[u32], stride: i32, w: i32, h: i32) {
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    if context.Map(texture, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped)).is_err() {
+        return;
+    }
+    let (w, h) = (w.clamp(0, stride), h.clamp(0, pixels.len() as i32 / stride.max(1)));
+    for y in 0..h as usize {
+        std::ptr::copy_nonoverlapping(pixels.as_ptr().add(y * stride as usize), (mapped.pData as *mut u8).add(y * mapped.RowPitch as usize) as *mut u32, w as usize);
+    }
+    context.Unmap(texture, 0);
 }
 
 /// The text of one piece of glass, for the card to blend over it, the size of that piece's page.
@@ -643,8 +726,8 @@ impl TextLayer {
         TextTarget { page: page.pixels.as_mut_ptr(), colour: self.colour.as_mut_ptr(), cover: self.cover.as_mut_ptr(), w: page.w, h: page.h, origin, clip, drew }
     }
 
-    /// Copy the text to the card.
-    unsafe fn upload(&mut self, device: &ID3D11Device, context: &ID3D11DeviceContext, drew: bool) {
+    /// Copy the text to the card: only the `used` top-left corner.
+    unsafe fn upload(&mut self, device: &ID3D11Device, context: &ID3D11DeviceContext, drew: bool, used: (i32, i32)) {
         self.showing = drew;
         if !drew {
             return;
@@ -652,30 +735,12 @@ impl TextLayer {
         let (w, h) = self.size;
         if !self.textures.as_ref().is_some_and(|t| t.4 == w && t.5 == h) {
             self.textures = None;
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: w as u32,
-                Height: h as u32,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-                ..Default::default()
-            };
-            let make = || -> Option<(ID3D11Texture2D, ID3D11ShaderResourceView)> {
-                let (mut texture, mut view) = (None, None);
-                device.CreateTexture2D(&desc, None, Some(&mut texture)).ok()?;
-                let texture = texture?;
-                device.CreateShaderResourceView(&texture, None, Some(&mut view)).ok()?;
-                Some((texture, view?))
-            };
-            let (Some(a), Some(b)) = (make(), make()) else { self.showing = false; return };
+            let (Some(a), Some(b)) = (frame_texture(device, w, h), frame_texture(device, w, h)) else { self.showing = false; return };
             self.textures = Some((a.0, b.0, a.1, b.1, w, h));
         }
         if let Some(t) = &self.textures {
-            context.UpdateSubresource(&t.0, 0, None, self.colour.as_ptr() as *const c_void, (w * 4) as u32, 0);
-            context.UpdateSubresource(&t.1, 0, None, self.cover.as_ptr() as *const c_void, (w * 4) as u32, 0);
+            write_corner(context, &t.0, &self.colour, w, used.0, used.1);
+            write_corner(context, &t.1, &self.cover, w, used.0, used.1);
         }
     }
 
@@ -756,45 +821,35 @@ impl Canvas for PlusCanvas {
         }
         let size = shown;
         unsafe {
-            // GDI+ loses an icon's transparency when given it directly, so draw it into memory first
-            use windows_sys::Win32::Graphics::Gdi::*;
-            let mut info: BITMAPINFO = std::mem::zeroed();
-            info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-            info.bmiHeader.biWidth = size;
-            info.bmiHeader.biHeight = -size;
-            info.bmiHeader.biPlanes = 1;
-            info.bmiHeader.biBitCount = 32;
-            let dc = CreateCompatibleDC(std::ptr::null_mut());
-            let mut bits = std::ptr::null_mut();
-            let dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
-            if !dib.is_null() {
-                let old = SelectObject(dc, dib as _);
-                windows_sys::Win32::UI::WindowsAndMessaging::DrawIconEx(dc, 0, 0, icon as _, size, size, 0, std::ptr::null_mut(), windows_sys::Win32::UI::WindowsAndMessaging::DI_NORMAL);
-                let mode = layers::ICON_TINT.load(Ordering::Relaxed);
-                if mode != 0 || fade < 256 {
-                    let colour = layers::tint_colour();
-                    for pixel in std::slice::from_raw_parts_mut(bits as *mut u32, (size * size) as usize) {
-                        if mode != 0 {
-                            *pixel = layers::tint_pixel(*pixel, mode, colour);
-                        }
-                        *pixel = faded(*pixel, fade); // icons are premultiplied, so every channel fades
+            // GDI+ loses an icon's transparency when given it directly, so its pixels are drawn into memory once
+            let Some(source) = icon_pixels_of(icon, size) else { return };
+            let mode = layers::ICON_TINT.load(Ordering::Relaxed);
+            let mut changed;
+            let bits: *const u32 = if mode != 0 || fade < 256 {
+                let colour = layers::tint_colour();
+                changed = source.to_vec();
+                for pixel in changed.iter_mut() {
+                    if mode != 0 {
+                        *pixel = layers::tint_pixel(*pixel, mode, colour);
                     }
+                    *pixel = faded(*pixel, fade); // icons are premultiplied, so every channel fades
                 }
-                let mut picture = std::ptr::null_mut();
-                if GdipCreateBitmapFromScan0(size, size, size * 4, PARGB, bits as *mut u8, &mut picture) == 0 {
-                    // pixel for pixel when whole: the usual smoothing would soften an icon already the
-                    // right size; squeezed by a hinge, smoothing keeps it clean
-                    GdipSetInterpolationMode(self.g, if across == shown { InterpolationModeNearestNeighbor } else { InterpolationModeHighQualityBilinear });
-                    GdipSetPixelOffsetMode(self.g, PixelOffsetModeHalf);
-                    GdipDrawImageRectI(self.g, picture as _, x, y, across, shown);
-                    GdipSetPixelOffsetMode(self.g, PixelOffsetModeDefault);
-                    GdipSetInterpolationMode(self.g, InterpolationModeDefault);
-                    GdipDisposeImage(picture as _);
-                }
-                SelectObject(dc, old);
-                DeleteObject(dib as _);
+                changed.as_ptr()
+            } else {
+                source.as_ptr()
+            };
+            let mut picture = std::ptr::null_mut();
+            // GDI+ only reads these pixels while drawing them
+            if GdipCreateBitmapFromScan0(size, size, size * 4, PARGB, bits as *mut u8, &mut picture) == 0 {
+                // pixel for pixel when whole: the usual smoothing would soften an icon already the
+                // right size; squeezed by a hinge, smoothing keeps it clean
+                GdipSetInterpolationMode(self.g, if across == shown { InterpolationModeNearestNeighbor } else { InterpolationModeHighQualityBilinear });
+                GdipSetPixelOffsetMode(self.g, PixelOffsetModeHalf);
+                GdipDrawImageRectI(self.g, picture as _, x, y, across, shown);
+                GdipSetPixelOffsetMode(self.g, PixelOffsetModeDefault);
+                GdipSetInterpolationMode(self.g, InterpolationModeDefault);
+                GdipDisposeImage(picture as _);
             }
-            DeleteDC(dc);
         }
     }
 }
@@ -876,6 +931,8 @@ struct Engine {
     gpu: Option<Gpu>,
     panel_text: TextLayer,
     rail_text: TextLayer,
+    /// The corner of the panel's page last copied to the card; words never show beyond it.
+    panel_used: (i32, i32),
     open_panel: Option<(Panel, Neck)>,
     waiting_panel: Option<Panel>,
     rail_showing: bool,
@@ -977,7 +1034,7 @@ pub unsafe fn start(window: HWND, dpi: f32) -> Result<(), String> {
         }
     };
     LIGHT_WANTED.store(false, Ordering::Relaxed);
-    *ENGINE.lock().unwrap() = Some(Engine { device, context, factory, dcomp, _target: target, rail, panel, neck, rail_rect: (0, 0, 1, 1), panel_size: (0, 0), origin: window_origin(window), dpi, _gdiplus: token, gpu, panel_text: TextLayer::default(), rail_text: TextLayer::default(), open_panel: None, waiting_panel: None, rail_showing: false, mouse: (0.0, 0.0, 0.0) });
+    *ENGINE.lock().unwrap() = Some(Engine { device, context, factory, dcomp, _target: target, rail, panel, neck, rail_rect: (0, 0, 1, 1), panel_size: (0, 0), origin: window_origin(window), dpi, _gdiplus: token, gpu, panel_text: TextLayer::default(), rail_text: TextLayer::default(), panel_used: (0, 0), open_panel: None, waiting_panel: None, rail_showing: false, mouse: (0.0, 0.0, 0.0) });
     Ok(())
 }
 
@@ -1190,6 +1247,19 @@ impl Engine {
         Ok(())
     }
 
+    /// Show a fully clear picture on a sprite.
+    unsafe fn blank(&self, s: &Sprite) {
+        let Some(swap) = &s.swap else { return };
+        let Ok(back) = swap.GetBuffer::<ID3D11Texture2D>(0) else { return };
+        let mut target = None;
+        if self.device.CreateRenderTargetView(&back, None, Some(&mut target)).is_ok() {
+            if let Some(target) = target {
+                self.context.ClearRenderTargetView(&target, &[0.0; 4]);
+                let _ = swap.Present(0, DXGI_PRESENT(0));
+            }
+        }
+    }
+
     /// Hand a finished picture to the screen.
     unsafe fn show(&self, s: &Sprite, x: f32, y: f32) {
         let (Some(swap), Some(page)) = (&s.swap, &s.page) else { return };
@@ -1235,38 +1305,18 @@ impl Engine {
     }
 
     /// Copy a sprite's page of words to the card.
-    unsafe fn upload_words(&self, s: &mut Sprite) {
+    unsafe fn upload_words(&self, s: &mut Sprite, used: (i32, i32)) {
         let Some(page) = s.page.as_ref() else { return };
         if s.words.is_none() {
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: page.w as u32,
-                Height: page.h as u32,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-                ..Default::default()
-            };
-            let (mut texture, mut view) = (None, None);
-            if self.device.CreateTexture2D(&desc, None, Some(&mut texture)).is_err() {
-                return;
-            }
-            let Some(texture) = texture else { return };
-            if self.device.CreateShaderResourceView(&texture, None, Some(&mut view)).is_err() {
-                return;
-            }
-            let Some(view) = view else { return };
-            s.words = Some((texture, view));
+            s.words = frame_texture(&self.device, page.w, page.h);
         }
         if let Some((texture, _)) = &s.words {
-            self.context.UpdateSubresource(texture, 0, None, page.pixels.as_ptr() as *const c_void, (page.w * 4) as u32, 0);
+            write_corner(&self.context, texture, &page.pixels, page.w, used.0, used.1);
         }
     }
 
     /// Draw glass shapes, then the words over them, and show the result.
-    unsafe fn render(&mut self, s: &Sprite, shapes: &[(Glass, ComRect)], with_words: bool, text: Option<(ID3D11ShaderResourceView, ID3D11ShaderResourceView)>, x: f32, y: f32) {
+    unsafe fn render(&mut self, s: &Sprite, shapes: &[(Glass, ComRect)], with_words: bool, text: Option<(ID3D11ShaderResourceView, ID3D11ShaderResourceView)>, area: ComRect, x: f32, y: f32) {
         let Some(wall) = self.wall() else { return };
         let (Some(gpu), Some(swap), Some(page)) = (self.gpu.as_ref(), &s.swap, &s.page) else { return };
         let Ok(back) = swap.GetBuffer::<ID3D11Texture2D>(0) else { return };
@@ -1294,14 +1344,14 @@ impl Engine {
         }
         if with_words {
             if let Some((_, view)) = &s.words {
-                c.RSSetScissorRects(Some(&[ComRect { left: 0, top: 0, right: page.w, bottom: page.h }]));
+                c.RSSetScissorRects(Some(&[area]));
                 c.PSSetShader(&gpu.words, None);
                 c.PSSetShaderResources(0, Some(&[Some(view.clone())]));
                 c.Draw(3, 0);
             }
         }
         if let Some((colour, cover)) = text {
-            c.RSSetScissorRects(Some(&[ComRect { left: 0, top: 0, right: page.w, bottom: page.h }]));
+            c.RSSetScissorRects(Some(&[area]));
             c.PSSetShader(&gpu.names, None);
             c.OMSetBlendState(&gpu.names_blend, Some(&[0.0; 4]), 0xFFFF_FFFF);
             c.PSSetShaderResources(0, Some(&[Some(colour), Some(cover)]));
@@ -1344,8 +1394,9 @@ impl Engine {
                     let mut c = PlusCanvas { g: page.g, dpi, alpha: 255, liquid: true, text };
                     layers::paint_rail_on(&mut c, dpi, layers::pill_tint());
                 }
-                self.upload_words(&mut rail);
-                self.rail_text.upload(&self.device, &self.context, drew);
+                let whole = rail.page.as_ref().map_or((0, 0), |p| (p.w, p.h));
+                self.upload_words(&mut rail, whole);
+                self.rail_text.upload(&self.device, &self.context, drew, whole);
             }
             let (left, top) = ((x - margin) as f32, (y - margin) as f32);
             let base = self.base_numbers(left, top);
@@ -1376,7 +1427,8 @@ impl Engine {
                 }
             }
             let text = self.rail_text.views();
-            self.render(&rail, &shapes, true, text, left, top);
+            let whole = rail.page.as_ref().map_or(ComRect::default(), |p| ComRect { left: 0, top: 0, right: p.w, bottom: p.h });
+            self.render(&rail, &shapes, true, text, whole, left, top);
         }
         self.rail = rail;
     }
@@ -1421,8 +1473,9 @@ impl Engine {
                     let mut c = PlusCanvas { g: page.g, dpi, alpha: 255, liquid: true, text };
                     layers::paint_settings_on(&mut c, dpi, layers::pill_tint(), layers::accent());
                 }
-                self.upload_words(&mut panel);
-                self.panel_text.upload(&self.device, &self.context, drew);
+                self.upload_words(&mut panel, (w, h));
+                self.panel_used = (w, h);
+                self.panel_text.upload(&self.device, &self.context, drew, (w, h));
             }
             let (lf, tf) = (left as f32, top as f32);
             let base = self.base_numbers(lf, tf);
@@ -1452,7 +1505,7 @@ impl Engine {
                 ..base
             };
             let names = if settings { self.panel_text.views() } else { None };
-            self.render(&panel, &[(numbers, ComRect { left: 0, top: 0, right: w, bottom: h })], settings, names, lf, tf);
+            self.render(&panel, &[(numbers, ComRect { left: 0, top: 0, right: w, bottom: h })], settings, names, ComRect { left: 0, top: 0, right: w.min(self.panel_used.0), bottom: h.min(self.panel_used.1) }, lf, tf);
         }
         self.panel = panel;
     }
@@ -1677,6 +1730,10 @@ pub unsafe fn hide_panel() {
         if let Some(e) = guard.as_mut() {
             e.open_panel = None;
             e.waiting_panel = None;
+            // leave nothing on the panel's last picture: the next opening moves the panel into place
+            // possibly a frame before its new picture lands, which flashed the old panel for a frame
+            e.blank(&e.panel);
+            e.blank(&e.neck);
             let _ = e.panel.visual.SetOffsetX2(FAR_AWAY);
             let _ = e.neck.visual.SetOffsetX2(FAR_AWAY);
             let _ = e.dcomp.Commit();

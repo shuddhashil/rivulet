@@ -260,6 +260,7 @@ fn appearance_page(mut b: Builder, cfg: &Config) -> Vec<Item> {
     b.choice("Icon size", "icon_size", &["Small", "Medium", "Large"], &cfg.icon_size);
     b.choice_pairs("Icon colour", "icon_tint", &[("Original", "off"), ("Section", "section"), ("Grey", "mono")], &cfg.icon_tint);
     b.choice("Panel corners", "corners", &["Square", "Soft", "Round"], &cfg.corners);
+    b.stepper("Label height", "general", "label_height", cfg.label_height as u64, 2, 28, 60);
     b.stepper("How solid panels are (%)", "general", "glass", cfg.glass as u64, 10, 20, 160);
     b.colour_row("Panel colour", "panel_colour", cfg.panel_colour);
     b.colour_row("Text colour", "text_colour", cfg.text_colour);

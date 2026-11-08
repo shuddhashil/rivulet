@@ -55,6 +55,8 @@ pub struct Config {
     pub panel_colour: Option<u32>,
     /// How solid a panel of files is, percent of normal.
     pub glass: u32,
+    /// How tall each label on the rail is, in pixels at 100% scale.
+    pub label_height: u32,
     /// The shortcut shows the sections over open windows instead of clearing them away.
     pub peek: bool,
     /// The labels fade while unused.
@@ -181,6 +183,7 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
         tint_colour: None,
         panel_colour: None,
         glass: 100,
+        label_height: 32,
         peek: false,
         fade: false,
         monitor_profiles: false,
@@ -274,6 +277,9 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
                 "fade" => cfg.fade = on_off(&key, value)?,
                 "monitor_profiles" => cfg.monitor_profiles = on_off(&key, value)?,
                 "pinned" => cfg.pinned = value.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+                "label_height" => {
+                    cfg.label_height = value.parse().ok().filter(|v| (28..=60).contains(v)).ok_or_else(|| format!("sections.ini: label_height should be 28 to 60: {line}"))?;
+                }
                 "glass" => {
                     glass_given = true;
                     cfg.glass = value.parse().ok().filter(|v| (20..=160).contains(v)).ok_or_else(|| format!("sections.ini: glass should be 20 to 160: {line}"))?;
@@ -831,6 +837,8 @@ mod tests {
         assert_eq!(classify("x.weird", ".weird", &c), "Other");
         assert_eq!(c.colours[0], ("Word".to_string(), 0xFF8C3F)); // stored blue first
         assert_eq!((c.recent_days, c.recent_limit), (5, 2));
+        assert_eq!(c.label_height, 32); // unset: the usual height
+        assert_eq!(parse_config(&format!("{INI}[general]\nlabel_height = 44\n")).unwrap().label_height, 44);
     }
 
     #[test]
@@ -1000,7 +1008,7 @@ mod tests {
 
     #[test]
     fn bad_settings_are_refused() {
-        for bad in ["side = up", "theme = neon", "speed = warp", "dots = maybe", "style = wood"] {
+        for bad in ["side = up", "theme = neon", "speed = warp", "label_height = 10", "dots = maybe", "style = wood"] {
             assert!(parse_config(&format!("[types]\nOther =\n[layout]\ncolumn1 = Other\n[general]\n{bad}\n")).is_err(), "{bad}");
         }
     }
