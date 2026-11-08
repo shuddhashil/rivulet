@@ -14,6 +14,7 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod layers;
+mod notes;
 mod pretty;
 mod ghost;
 mod rules;
@@ -67,6 +68,7 @@ const WM_TAKE_KEYS: u32 = WM_APP + 5;
 const HOTKEY_FIND: usize = 2;
 const HOTKEY_NEXT: usize = 3;
 const HOTKEY_PREVIOUS: usize = 4;
+const HOTKEY_NOTE: usize = 5;
 /// The section that lists what is being typed to find.
 const FIND: &str = "Find";
 const WM_GIVE_BACK_KEYS: u32 = WM_APP + 6;
@@ -1082,6 +1084,7 @@ impl Sections {
                 pretty::drop_backdrop();
             }
         }
+        notes::redraw_soon();
         true
     }
 
@@ -1411,10 +1414,12 @@ impl Sections {
                 self.draw_open(&plan, at, r, 1.0);
                 let (sx, sy) = plan.screen_origin;
                 *PANEL_ON_SCREEN.lock().unwrap() = Some(RECT { left: sx + r.x, top: sy + r.y, right: sx + r.x + r.w, bottom: sy + r.y + r.h });
+                notes::make_room(*PANEL_ON_SCREEN.lock().unwrap());
             }
             None => {
                 layers::hide_panel();
                 *PANEL_ON_SCREEN.lock().unwrap() = None;
+                notes::make_room(None);
             }
         }
         self.last_plan = Some(plan);
@@ -1426,6 +1431,10 @@ impl Sections {
     /// swells past full size and settles; `start` carries on a spring caught part-way through a fold.
     unsafe fn flow(&mut self, plan: &Plan, at: usize, opening: bool, start: Option<Spring>) {
         let Some((full, across)) = plan.panel(at) else { return };
+        if opening {
+            let (sx, sy) = plan.screen_origin;
+            notes::make_room(Some(RECT { left: sx + full.x, top: sy + full.y, right: sx + full.x + full.w, bottom: sy + full.y + full.h }));
+        }
         // Rivulet draws its own icons as part of the panel, so Explorer's stay parked
         let icons = if plan.cfg.own_icons { vec![] } else { plan.groups[at].1.clone() };
         let m = plan.m;
@@ -1636,6 +1645,7 @@ impl Sections {
                 layers::hide_panel();
             }
         }
+        notes::make_room(None);
     }
 
     /// The layout from the last settle, which Windows' change reports keep fresh, so a click
@@ -2654,7 +2664,7 @@ unsafe fn over_desktop(pt: POINT) -> bool {
     let mut name = [0u16; 32];
     let n = GetClassNameW(WindowFromPoint(pt), name.as_mut_ptr(), 32).max(0) as usize;
     let class = String::from_utf16_lossy(&name[..n]);
-    matches!(class.as_str(), "SysListView32" | "SHELLDLL_DefView" | "WorkerW" | "Progman" | "DesktopSectionsLayer")
+    matches!(class.as_str(), "SysListView32" | "SHELLDLL_DefView" | "WorkerW" | "Progman" | "DesktopSectionsLayer" | "RivuletNote")
 }
 
 /// The rail with `name` moved to where `onto` is: the labels keep their places on screen and the
@@ -3036,6 +3046,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
         let pt = (*(lparam as *const MSLLHOOKSTRUCT)).pt;
         match wparam as u32 {
             WM_MOUSEMOVE => {
+                notes::moved(pt);
                 mouse_moved(pt);
                 if pretty::note_mouse(pt.x, pt.y) {
                     send(Command::Light);
@@ -3050,11 +3061,15 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 if layers::peeking() && !over_desktop(pt) {
                     send(Command::PeekOff); // a click elsewhere puts Peek away, and still goes where it was aimed
                 }
+                if over_desktop(pt) && label_at(pt).is_none() && !in_panel(pt) && notes::press(pt) {
+                    return 1;
+                }
                 if left_down(pt) {
                     SWALLOW_RELEASE.store(true, Ordering::Relaxed);
                     return 1;
                 }
             }
+            WM_LBUTTONUP if notes::release() => return 1,
             WM_LBUTTONUP => {
                 if SWALLOW_RELEASE.swap(false, Ordering::Relaxed) {
                     if reorder_released() {
@@ -3077,6 +3092,8 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 }
                 left_up(pt);
             }
+            WM_RBUTTONDOWN if over_desktop(pt) && label_at(pt).is_none() && !in_panel(pt) && notes::right_press(pt) => return 1,
+            WM_RBUTTONUP if notes::right_release() => return 1,
             WM_RBUTTONDOWN if over_desktop(pt) && label_at(pt).is_some() => {
                 RIGHT_ON_LABEL.store(true, Ordering::Relaxed);
                 return 1; // our menu, not the desktop's
@@ -3159,7 +3176,7 @@ pub unsafe fn dark_menus() {
 unsafe fn show_menu(hwnd: HWND) {
     dark_menus();
     let menu = CreatePopupMenu();
-    for (id, text) in [(5, "Settings"), (1, "Re-sort now"), (2, "Edit rules"), (3, "Undo and stop"), (4, "Stop")] {
+    for (id, text) in [(6, "New sticky note"), (5, "Settings"), (1, "Re-sort now"), (2, "Edit rules"), (3, "Undo and stop"), (4, "Stop")] {
         AppendMenuW(menu, MF_STRING, id, wide(text).as_ptr());
     }
     let mut pt = POINT { x: 0, y: 0 };
@@ -3174,6 +3191,7 @@ unsafe fn show_menu(hwnd: HWND) {
         3 => run_undo(),
         4 => send(Command::Stop),
         5 => send(Command::Toggle(SETTINGS.to_string())),
+        6 => notes::new_note(),
         _ => {}
     }
 }
@@ -3183,6 +3201,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         WM_RETIDY | WM_DISPLAYCHANGE | WM_DPICHANGED => send(Command::Retidy),
         WM_SETTINGCHANGE if wparam == SPI_SETWORKAREA_CHANGE => send(Command::Retidy), // the taskbar moved
         WM_STOP => send(Command::Stop),
+        WM_HOTKEY if wparam == HOTKEY_NOTE => notes::new_note(),
+        notes::WM_NOTE => notes::handle(hwnd, wparam, lparam as usize),
         WM_HOTKEY => send(match wparam {
             HOTKEY_FIND => Command::Find,
             HOTKEY_NEXT => Command::Workspace(1),
@@ -3209,9 +3229,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 eprintln!("{e}");
             }
             start_pretty_if_wanted();
+            notes::remake();
             watch_icons();
         }
-        WM_CLOSE => PostQuitMessage(0),
+        WM_CLOSE => {
+            notes::stop();
+            PostQuitMessage(0)
+        }
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
     0
@@ -3390,6 +3414,7 @@ unsafe fn run() -> Result<(), String> {
     OWNER.store(window as usize, Ordering::Relaxed);
     layers::create()?;
     start_pretty_if_wanted();
+    notes::start(window);
     let (tx, rx) = channel();
     let _ = COMMANDS.set(tx);
     watch_wallpaper();
@@ -3411,6 +3436,7 @@ unsafe fn run() -> Result<(), String> {
         RegisterHotKey(window, HOTKEY_FIND as i32, CTRL_ALT | NO_REPEAT, 0x46);
         RegisterHotKey(window, HOTKEY_NEXT as i32, CTRL_ALT | NO_REPEAT, 0x22);
         RegisterHotKey(window, HOTKEY_PREVIOUS as i32, CTRL_ALT | NO_REPEAT, 0x21);
+        RegisterHotKey(window, HOTKEY_NOTE as i32, CTRL_ALT | NO_REPEAT, 0x4E); // Ctrl+Alt+N, a new sticky note
     }
     let handle = window as usize;
     let desk_for_worker = SendDesktop(desk);
@@ -3420,6 +3446,7 @@ unsafe fn run() -> Result<(), String> {
     });
     let mut msg = std::mem::zeroed();
     while GetMessageW(&mut msg, null(), 0, 0) > 0 {
+        TranslateMessage(&msg); // key presses become letters for a sticky note being typed
         DispatchMessageW(&msg);
     }
     UnhookWindowsHookEx(hook);
@@ -3572,6 +3599,8 @@ fn alert(text: &str) {
 }
 
 fn main() {
+    // the program has no console, so a crash would otherwise leave no word of why
+    std::panic::set_hook(Box::new(|info| log(&format!("crashed: {info}"))));
     let arg = std::env::args().nth(1).unwrap_or_default();
     let result = unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2); // work in real screen pixels

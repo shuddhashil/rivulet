@@ -73,6 +73,21 @@ pub enum Style {
     Small,
     Heading,
     Glyph,
+    /// A sticky note's handwriting, at this size in points.
+    Note(u8),
+}
+
+impl Style {
+    pub fn id(self) -> u8 {
+        match self {
+            Style::Name => 0,
+            Style::Label => 1,
+            Style::Small => 2,
+            Style::Heading => 3,
+            Style::Glyph => 4,
+            Style::Note(_) => 5,
+        }
+    }
 }
 
 /// What the rail and Settings need from a drawing surface.
@@ -144,7 +159,7 @@ impl Canvas for GdiCanvas {
                 Style::Small => 1,
                 Style::Heading => 2,
                 Style::Glyph => 3,
-                Style::Name => 4,
+                Style::Name | Style::Note(_) => 4,
             };
             SelectObject(self.dc, self.fonts[index] as _);
             SetTextColor(self.dc, colour);
@@ -378,6 +393,7 @@ pub fn style_font(style: Style) -> (&'static str, f32, i32) {
         Style::Small => (face, 11.0 * scale, 400),
         Style::Heading => (face, 14.0 * scale, 700),
         Style::Glyph => ("Segoe MDL2 Assets", 14.0, 400),
+        Style::Note(size) => ("Segoe Print", size as f32, 400),
     }
 }
 

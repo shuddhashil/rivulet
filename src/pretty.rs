@@ -496,7 +496,7 @@ unsafe fn text_tile(text: &str, w: i32, h: i32, style: Style, flags: u32, dpi: f
     use windows_sys::Win32::Graphics::Gdi::*;
     let (face, size, weight) = layers::style_font(style);
     let pixels = (size * dpi).round() as i32;
-    let key = (format!("{face}\0{text}"), w, h, style as u8, flags, pixels);
+    let key = (format!("{face}\0{text}"), w, h, style.id(), flags, pixels);
     if let Some(tile) = TILES.with(|t| t.borrow().get(&key).cloned()) {
         return tile;
     }
@@ -553,7 +553,8 @@ unsafe fn text_tile(text: &str, w: i32, h: i32, style: Style, flags: u32, dpi: f
 
 unsafe fn draw_text(t: &TextTarget, r: RECT, text: &str, colour: u32, style: Style, flags: u32, dpi: f32) {
     let (w, h) = (r.right - r.left, r.bottom - r.top);
-    if w <= 0 || h <= 0 {
+    // no words, nothing to draw: Windows' text drawing crashed on an empty string (a new sticky note)
+    if w <= 0 || h <= 0 || text.is_empty() {
         return;
     }
     let fade = draw_fade();
@@ -922,6 +923,10 @@ struct Engine {
     rail: Sprite,
     panel: Sprite,
     neck: Sprite,
+    /// Holds every sprite; sticky notes are added beneath the panel, so sections open over them.
+    root: IDCompositionVisual,
+    /// Sticky notes in liquid glass, by the id notes.rs gives them, each with its own words.
+    notes: Vec<(usize, Sprite, TextLayer)>,
     rail_rect: (i32, i32, i32, i32),
     panel_size: (i32, i32),
     /// Where this window's corner is on the screen, to line glass up with the wallpaper.
@@ -1034,7 +1039,7 @@ pub unsafe fn start(window: HWND, dpi: f32) -> Result<(), String> {
         }
     };
     LIGHT_WANTED.store(false, Ordering::Relaxed);
-    *ENGINE.lock().unwrap() = Some(Engine { device, context, factory, dcomp, _target: target, rail, panel, neck, rail_rect: (0, 0, 1, 1), panel_size: (0, 0), origin: window_origin(window), dpi, _gdiplus: token, gpu, panel_text: TextLayer::default(), rail_text: TextLayer::default(), panel_used: (0, 0), open_panel: None, waiting_panel: None, rail_showing: false, mouse: (0.0, 0.0, 0.0) });
+    *ENGINE.lock().unwrap() = Some(Engine { device, context, factory, dcomp, _target: target, rail, panel, neck, root, notes: Vec::new(), rail_rect: (0, 0, 1, 1), panel_size: (0, 0), origin: window_origin(window), dpi, _gdiplus: token, gpu, panel_text: TextLayer::default(), rail_text: TextLayer::default(), panel_used: (0, 0), open_panel: None, waiting_panel: None, rail_showing: false, mouse: (0.0, 0.0, 0.0) });
     Ok(())
 }
 
@@ -1563,6 +1568,89 @@ impl Engine {
         self.rail = rail;
     }
 
+    /// A sticky note as liquid glass: `x`, `y` on screen, white handwriting, and a caret while it
+    /// is typed in (x, y, height, from the words' top left). False when there is no liquid glass.
+    unsafe fn glass_note(&mut self, id: usize, x: i32, y: i32, w: i32, h: i32, colour: u32, text: &str, size: u8, words_at: (i32, i32, i32), strip: i32, caret: Option<(i32, i32, i32)>) -> bool {
+        if !self.liquid_on() {
+            return false;
+        }
+        let dpi = self.dpi;
+        let margin = (52.0 * dpi) as i32; // room for the soft shadow it floats on
+        let at = match self.notes.iter().position(|n| n.0 == id) {
+            Some(i) => i,
+            None => {
+                let Ok(visual) = self.dcomp.CreateVisual() else { return false };
+                if self.root.AddVisual(&visual, false, &self.panel.visual).is_err() {
+                    return false;
+                }
+                self.notes.push((id, Sprite { visual, swap: None, page: None, words: None }, TextLayer::default()));
+                self.notes.len() - 1
+            }
+        };
+        let (_, mut sprite, mut layer) = self.notes.remove(at);
+        let (pw, ph) = (w + 2 * margin, h + 2 * margin);
+        if self.ensure(&mut sprite, pw, ph).is_ok() {
+            let mut drew = false;
+            if let Some(page) = sprite.page.as_mut() {
+                page.clear();
+                let t = layer.begin(page, (margin, margin), (margin, margin, margin + w, margin + h), &mut drew);
+                let (left, top, right) = words_at;
+                draw_text(&t, RECT { left, top, right, bottom: h }, text, 0x00FFFFFF, Style::Note(size), windows_sys::Win32::Graphics::Gdi::DT_WORDBREAK, dpi);
+                draw_text(&t, RECT { left: w - strip, top: 0, right: w, bottom: strip }, "\u{00D7}", 0x00FFFFFF, Style::Label, windows_sys::Win32::Graphics::Gdi::DT_CENTER, dpi);
+                if let Some((cx, cy, ch)) = caret {
+                    let thick = dpi.round().max(1.0) as i32;
+                    for py in cy..cy + ch {
+                        for px in cx..cx + thick {
+                            let (gx, gy) = (margin + left + px, margin + top + py);
+                            if gx >= 0 && gx < t.w && gy >= 0 && gy < t.h {
+                                let i = (gy * t.w + gx) as usize;
+                                *t.colour.add(i) = colour_for_card(0x00FF_FFFF, argb(0x00FFFFFF, 255));
+                                *t.cover.add(i) = 0x00FF_FFFF;
+                            }
+                        }
+                    }
+                }
+                // the grip in the bottom-right corner, for pulling the note bigger: three short
+                // slanted lines, softer than the words
+                let (s, inset, thick) = ((12.0 * dpi) as i32, (7.0 * dpi) as i32, dpi.round().max(1.0) as i32);
+                for dy in 0..s {
+                    for dx in 0..s {
+                        let d = dx + dy;
+                        if d < s || (d - s) % (s / 3).max(1) >= thick {
+                            continue;
+                        }
+                        let (gx, gy) = (margin + w - inset - s + dx, margin + h - inset - s + dy);
+                        if gx >= 0 && gx < t.w && gy >= 0 && gy < t.h {
+                            let i = (gy * t.w + gx) as usize;
+                            *t.colour.add(i) = colour_for_card(0x00B0_B0B0, argb(0x00FFFFFF, 255));
+                            *t.cover.add(i) = 0x00B0_B0B0;
+                        }
+                    }
+                }
+                drew = true;
+            }
+            self.upload_words(&mut sprite, (pw, ph));
+            layer.upload(&self.device, &self.context, drew, (pw, ph));
+            let (lf, tf) = (x as f32 - self.origin.0 - margin as f32, y as f32 - self.origin.1 - margin as f32);
+            let base = self.base_numbers(lf, tf);
+            let numbers = Glass {
+                box_: [margin as f32, margin as f32, w as f32, h as f32],
+                // always frosted, even in Clear: the words must stand out from the wallpaper
+                shape: [16.0 * dpi, 18.0 * dpi, 3.0, dpi],
+                tint: card_colour(colour, 0.38),
+                mouse: [base.mouse[0], base.mouse[1], base.mouse[2], 0.6],
+                look: [if base.look[0] == 3.0 { 0.0 } else { base.look[0] }, base.look[1], 0.6, 0.0],
+                glow: vivid(colour),
+                fade: [1.0, 1.0, 0.0, 0.0], // floats on the wide soft shadow, as an open panel does
+                ..base
+            };
+            let whole = ComRect { left: 0, top: 0, right: pw, bottom: ph };
+            self.render(&sprite, &[(numbers, whole)], true, layer.views(), whole, lf, tf);
+        }
+        self.notes.insert(at, (id, sprite, layer));
+        true
+    }
+
     fn liquid_on(&self) -> bool {
         let on = self.gpu.is_some() && BACKDROP.lock().map(|b| b.as_ref().is_some_and(|b| b.liquid)).unwrap_or(false);
         LIGHT_WANTED.store(on, Ordering::Relaxed);
@@ -1695,6 +1783,27 @@ mod tests {
         assert!(d > 40.0);
         let (d, nx, ny) = edge_info(0.5, 0.5, 100.0, 100.0, 10.0); // outside the rounded corner
         assert!(d < 0.0 && nx < 0.0 && ny < 0.0);
+    }
+}
+
+/// Draw a sticky note in liquid glass; false when the glass is off, so the note draws itself.
+pub unsafe fn note(id: usize, x: i32, y: i32, w: i32, h: i32, colour: u32, text: &str, size: u8, words_at: (i32, i32, i32), strip: i32, caret: Option<(i32, i32, i32)>) -> bool {
+    let Ok(mut guard) = ENGINE.lock() else { return false };
+    guard.as_mut().is_some_and(|e| e.glass_note(id, x, y, w, h, colour, text, size, words_at, strip, caret))
+}
+
+/// A sticky note deleted, or drawn plainly again.
+pub fn forget_note(id: usize) {
+    if let Ok(mut guard) = ENGINE.lock() {
+        if let Some(e) = guard.as_mut() {
+            if let Some(i) = e.notes.iter().position(|n| n.0 == id) {
+                let (_, sprite, _) = e.notes.remove(i);
+                unsafe {
+                    let _ = e.root.RemoveVisual(&sprite.visual);
+                    let _ = e.dcomp.Commit();
+                }
+            }
+        }
     }
 }
 
